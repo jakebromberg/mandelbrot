@@ -6,6 +6,7 @@
 //
 
 import MetalKit
+import Numerics
 
 // The Swift definition of the parameters, matching the Metal struct.
 struct MandelbrotParams {
@@ -19,36 +20,116 @@ struct MandelbrotParams {
     var options: UInt32       // bit 0: periodicity check
 }
 
+// Parameters for perturbation rendering, matching the Metal struct.
+// Double-precision values are split into (hi, lo) float pairs for extended precision.
+struct PerturbationParams {
+    var referenceCenterHiLo: SIMD4<Float>  // (hi_x, lo_x, hi_y, lo_y)
+    var viewCenterHiLo: SIMD4<Float>       // (hi_x, lo_x, hi_y, lo_y)
+    var scaleHiLo: SIMD2<Float>            // (hi, lo)
+    var scaleAspectHiLo: SIMD2<Float>      // (hi, lo)
+    var width: UInt32
+    var height: UInt32
+    var maxIterations: UInt32
+    var orbitLength: UInt32
+    var colorMode: UInt32
+    var padding: UInt32 = 0
+
+    /// Splits a Double into high and low Float components.
+    /// hi contains the value rounded to float precision.
+    /// lo contains the error (original - hi), also as float.
+    static func splitDouble(_ value: Double) -> (hi: Float, lo: Float) {
+        let hi = Float(value)
+        let lo = Float(value - Double(hi))
+        return (hi, lo)
+    }
+
+    init(referenceCenter: Complex<Double>,
+         viewCenter: Complex<Double>,
+         scale: Double,
+         scaleAspect: Double,
+         width: UInt32,
+         height: UInt32,
+         maxIterations: UInt32,
+         orbitLength: UInt32,
+         colorMode: UInt32) {
+
+        let refX = Self.splitDouble(referenceCenter.real)
+        let refY = Self.splitDouble(referenceCenter.imaginary)
+        self.referenceCenterHiLo = SIMD4(refX.hi, refX.lo, refY.hi, refY.lo)
+
+        let viewX = Self.splitDouble(viewCenter.real)
+        let viewY = Self.splitDouble(viewCenter.imaginary)
+        self.viewCenterHiLo = SIMD4(viewX.hi, viewX.lo, viewY.hi, viewY.lo)
+
+        let scaleSplit = Self.splitDouble(scale)
+        self.scaleHiLo = SIMD2(scaleSplit.hi, scaleSplit.lo)
+
+        let scaleAspectSplit = Self.splitDouble(scaleAspect)
+        self.scaleAspectHiLo = SIMD2(scaleAspectSplit.hi, scaleAspectSplit.lo)
+
+        self.width = width
+        self.height = height
+        self.maxIterations = maxIterations
+        self.orbitLength = orbitLength
+        self.colorMode = colorMode
+        self.padding = 0
+    }
+}
+
 class Renderer: NSObject, MTKViewDelegate {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     var computePipelineState: MTLComputePipelineState
+    var perturbationPipelineState: MTLComputePipelineState?
     var params: MandelbrotParams
     var outputTexture: MTLTexture?
     var paletteTexture: MTLTexture?
     var paletteSampler: MTLSamplerState?
+
+    // Perturbation theory support
+    private(set) var renderingMode: RenderingMode = .standard
+    private var referenceOrbit: ReferenceOrbit?
+    private var referenceOrbitBuffer: MTLBuffer?
+    private var centerDouble: Complex<Double> = Complex(0.0, 0.0)
+    private var scaleDouble: Double = 1.0
+
+    /// Scale threshold below which perturbation mode is used.
+    /// At scales smaller than this, single-precision floats lose accuracy.
+    private let perturbationThreshold: Double = 1e-6
+
+    /// How much the center can drift (as fraction of scale) before recomputing reference orbit.
+    private let referenceDriftThreshold: Double = 0.1
     
     init?(mtkView: MTKView) {
         // Ensure a Metal device is available.
         guard let device = mtkView.device else { return nil }
         self.device = device
-        
+
         guard let commandQueue = device.makeCommandQueue() else { return nil }
         self.commandQueue = commandQueue
-        
-        // Load the default Metal library and locate the compute function.
+
+        // Load the default Metal library and locate the compute functions.
         guard let library = device.makeDefaultLibrary(),
               let kernelFunction = library.makeFunction(name: "mandelbrotKernel") else {
             return nil
         }
-        
+
         do {
             computePipelineState = try device.makeComputePipelineState(function: kernelFunction)
         } catch {
             print("Error creating compute pipeline state: \(error)")
             return nil
         }
-        
+
+        // Create perturbation pipeline if the kernel exists
+        if let perturbationFunction = library.makeFunction(name: "mandelbrotPerturbationKernel") {
+            do {
+                perturbationPipelineState = try device.makeComputePipelineState(function: perturbationFunction)
+            } catch {
+                print("Warning: Could not create perturbation pipeline: \(error)")
+            }
+        }
+
         // Set default parameters (adjust scale/center to view the desired portion).
         let drawableSize = mtkView.drawableSize
         let aspect = Float(drawableSize.width) / Float(drawableSize.height)
@@ -62,9 +143,9 @@ class Renderer: NSObject, MTKViewDelegate {
             colorMode: 0,
             options: 1 // enable periodicity
         )
-        
+
         super.init()
-        
+
         // Create an output texture to hold the computed image.
         createOutputTexture(size: drawableSize)
 
@@ -139,8 +220,71 @@ class Renderer: NSObject, MTKViewDelegate {
         }
         self.paletteTexture = tex
     }
-    
-    // MTKViewDelegate: Called when the view’s drawable size changes.
+
+    // MARK: - Center and Scale Management
+
+    /// Sets the center and scale, automatically choosing rendering mode and updating reference orbit as needed.
+    func setCenter(_ center: Complex<Double>, scale: Double) {
+        centerDouble = center
+        scaleDouble = scale
+
+        // Update single-precision params for standard rendering
+        params.center = SIMD2<Float>(Float(center.real), Float(center.imaginary))
+        params.scale = Float(scale)
+
+        // Determine rendering mode based on scale
+        let shouldUsePerturbation = scale < perturbationThreshold && perturbationPipelineState != nil
+
+        if shouldUsePerturbation {
+            renderingMode = .perturbation
+            updateReferenceOrbitIfNeeded()
+        } else {
+            renderingMode = .standard
+        }
+    }
+
+    /// Checks if reference orbit needs recomputation and updates it if necessary.
+    private func updateReferenceOrbitIfNeeded() {
+        guard renderingMode == .perturbation else { return }
+
+        let needsRecompute: Bool
+        if let existing = referenceOrbit {
+            // Check if center has drifted too far from reference
+            let drift = Complex(centerDouble.real - existing.center.real,
+                               centerDouble.imaginary - existing.center.imaginary)
+            let driftMagnitude = sqrt(drift.real * drift.real + drift.imaginary * drift.imaginary)
+            needsRecompute = driftMagnitude > scaleDouble * referenceDriftThreshold
+        } else {
+            needsRecompute = true
+        }
+
+        if needsRecompute {
+            computeReferenceOrbit()
+        }
+    }
+
+    /// Computes a new reference orbit at the current center.
+    private func computeReferenceOrbit() {
+        let orbit = ReferenceOrbit(center: centerDouble)
+        orbit.computeOrbit(maxIterations: Int(params.maxIterations))
+
+        // Pack orbit data for GPU
+        let packedData = orbit.packForGPU()
+
+        // Create or update the Metal buffer
+        if !packedData.isEmpty {
+            let bufferSize = packedData.count * MemoryLayout<Float>.stride
+            referenceOrbitBuffer = device.makeBuffer(bytes: packedData, length: bufferSize, options: .storageModeShared)
+        } else {
+            referenceOrbitBuffer = nil
+        }
+
+        referenceOrbit = orbit
+    }
+
+    // MARK: - MTKViewDelegate
+
+    // MTKViewDelegate: Called when the view's drawable size changes.
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         if size.width < 1.0  ||
            size.height < 1.0 ||
@@ -161,34 +305,26 @@ class Renderer: NSObject, MTKViewDelegate {
               let computeEncoder = commandBuffer.makeComputeCommandEncoder() else {
             return
         }
-        
-        computeEncoder.setComputePipelineState(computePipelineState)
-        // Bind the output texture (index 0 in the shader).
-        computeEncoder.setTexture(outputTexture, index: 0)
-        // Bind palette texture (index 1) if available
-        if let paletteTexture = paletteTexture {
-            computeEncoder.setTexture(paletteTexture, index: 1)
+
+        // Choose rendering path based on mode
+        if renderingMode == .perturbation,
+           let perturbationPipeline = perturbationPipelineState,
+           let orbitBuffer = referenceOrbitBuffer,
+           let orbit = referenceOrbit {
+            // Perturbation rendering
+            drawPerturbation(encoder: computeEncoder,
+                           pipeline: perturbationPipeline,
+                           orbitBuffer: orbitBuffer,
+                           orbit: orbit,
+                           outputTexture: outputTexture)
+        } else {
+            // Standard rendering
+            drawStandard(encoder: computeEncoder, outputTexture: outputTexture)
         }
-        // Pass in the Mandelbrot parameters (index 0 for the constant buffer).
-        var currentParams = params
-        currentParams.scaleAspect = params.scale * Float(params.width) / Float(params.height)
-        computeEncoder.setBytes(&currentParams, length: MemoryLayout<MandelbrotParams>.stride, index: 0)
-        // Sampler at index 0
-        if let sampler = paletteSampler {
-            computeEncoder.setSamplerState(sampler, index: 0)
-        }
-        
-        // Use fixed threadgroup size and dispatchThreadgroups with rounded-up group counts
-        let tgWidth = 16
-        let tgHeight = 8
-        let threadsPerGroup = MTLSize(width: tgWidth, height: tgHeight, depth: 1)
-        let groupsX = (Int(params.width) + tgWidth - 1) / tgWidth
-        let groupsY = (Int(params.height) + tgHeight - 1) / tgHeight
-        let threadgroupsPerGrid = MTLSize(width: groupsX, height: groupsY, depth: 1)
-        computeEncoder.dispatchThreadgroups(threadgroupsPerGrid, threadsPerThreadgroup: threadsPerGroup)
+
         computeEncoder.endEncoding()
-        
-        // Use a blit pass to copy the output texture into the drawable’s texture.
+
+        // Use a blit pass to copy the output texture into the drawable's texture.
         if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
             let origin = MTLOrigin(x: 0, y: 0, z: 0)
             let size = MTLSize(width: Int(params.width), height: Int(params.height), depth: 1)
@@ -205,8 +341,70 @@ class Renderer: NSObject, MTKViewDelegate {
             )
             blitEncoder.endEncoding()
         }
-        
+
         commandBuffer.present(drawable)
         commandBuffer.commit()
+    }
+
+    private func drawStandard(encoder: MTLComputeCommandEncoder, outputTexture: MTLTexture) {
+        encoder.setComputePipelineState(computePipelineState)
+        encoder.setTexture(outputTexture, index: 0)
+        if let paletteTexture = paletteTexture {
+            encoder.setTexture(paletteTexture, index: 1)
+        }
+
+        var currentParams = params
+        currentParams.scaleAspect = params.scale * Float(params.width) / Float(params.height)
+        encoder.setBytes(&currentParams, length: MemoryLayout<MandelbrotParams>.stride, index: 0)
+
+        if let sampler = paletteSampler {
+            encoder.setSamplerState(sampler, index: 0)
+        }
+
+        dispatchThreadgroups(encoder: encoder)
+    }
+
+    private func drawPerturbation(encoder: MTLComputeCommandEncoder,
+                                  pipeline: MTLComputePipelineState,
+                                  orbitBuffer: MTLBuffer,
+                                  orbit: ReferenceOrbit,
+                                  outputTexture: MTLTexture) {
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(outputTexture, index: 0)
+        if let paletteTexture = paletteTexture {
+            encoder.setTexture(paletteTexture, index: 1)
+        }
+
+        let aspect = Double(params.width) / Double(params.height)
+        var perturbParams = PerturbationParams(
+            referenceCenter: orbit.center,
+            viewCenter: centerDouble,
+            scale: scaleDouble,
+            scaleAspect: scaleDouble * aspect,
+            width: params.width,
+            height: params.height,
+            maxIterations: params.maxIterations,
+            orbitLength: UInt32(orbit.count),
+            colorMode: params.colorMode
+        )
+
+        encoder.setBytes(&perturbParams, length: MemoryLayout<PerturbationParams>.stride, index: 0)
+        encoder.setBuffer(orbitBuffer, offset: 0, index: 1)
+
+        if let sampler = paletteSampler {
+            encoder.setSamplerState(sampler, index: 0)
+        }
+
+        dispatchThreadgroups(encoder: encoder)
+    }
+
+    private func dispatchThreadgroups(encoder: MTLComputeCommandEncoder) {
+        let tgWidth = 16
+        let tgHeight = 8
+        let threadsPerGroup = MTLSize(width: tgWidth, height: tgHeight, depth: 1)
+        let groupsX = (Int(params.width) + tgWidth - 1) / tgWidth
+        let groupsY = (Int(params.height) + tgHeight - 1) / tgHeight
+        let threadgroupsPerGrid = MTLSize(width: groupsX, height: groupsY, depth: 1)
+        encoder.dispatchThreadgroups(threadgroupsPerGrid, threadsPerThreadgroup: threadsPerGroup)
     }
 }

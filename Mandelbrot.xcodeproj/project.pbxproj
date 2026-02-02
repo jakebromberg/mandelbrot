@@ -71,6 +71,25 @@
 		};
 /* End PBXFrameworksBuildPhase section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		23NUMERICS2D570F9800F9B18E /* XCRemoteSwiftPackageReference "swift-numerics" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-numerics";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		23NUMERICSPD2D570F9800F9B18E /* Numerics */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 23NUMERICS2D570F9800F9B18E /* XCRemoteSwiftPackageReference "swift-numerics" */;
+			productName = Numerics;
+		};
+/* End XCSwiftPackageProductDependency section */
+
 /* Begin PBXGroup section */
 		2386F0E02D570F9800F9B18E = {
 			isa = PBXGroup;
@@ -112,6 +131,7 @@
 			);
 			name = Mandelbrot;
 			packageProductDependencies = (
+				23NUMERICSPD2D570F9800F9B18E /* Numerics */,
 			);
 			productName = Mandelbrot;
 			productReference = 2386F0E92D570F9800F9B18E /* Mandelbrot.app */;
@@ -196,6 +216,7 @@
 			mainGroup = 2386F0E02D570F9800F9B18E;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
+				23NUMERICS2D570F9800F9B18E /* XCRemoteSwiftPackageReference "swift-numerics" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 2386F0EA2D570F9800F9B18E /* Products */;

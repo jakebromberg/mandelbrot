@@ -6,30 +6,93 @@
 //
 
 import SwiftUI
+import Numerics
 
 struct ContentView: View {
     @State private var colorMode: UInt32 = 0 // 0=HSV, 1=Palette
+    @State private var currentScale: Double = 2.0
+    @State private var currentCenter: Complex<Double> = Complex(-0.75, 0.0)
+    @State private var renderingMode: RenderingMode = .standard
+
     var body: some View {
         GeometryReader { geometry in
-            ZStack(alignment: .topTrailing) {
+            ZStack(alignment: .top) {
                 MandelbrotView(
                     size: geometry.size,
                     scale: 2.0,
-                    center: SIMD2<Float>(-0.75, 0.0),
-                    colorMode: colorMode
+                    center: Complex(-0.75, 0.0),
+                    colorMode: colorMode,
+                    onStateChange: { scale, center, mode in
+                        currentScale = scale
+                        currentCenter = center
+                        renderingMode = mode
+                    }
                 )
                 .edgesIgnoringSafeArea(.all)
 
-                Picker("Color", selection: $colorMode) {
-                    Text("HSV").tag(UInt32(0))
-                    Text("Palette").tag(UInt32(1))
+                HStack(spacing: 12) {
+                    // Zoom depth indicator
+                    ZoomIndicator(scale: currentScale)
+
+                    // Mode indicator
+                    ModeIndicator(mode: renderingMode)
+
+                    Spacer()
+
+                    // Color mode picker
+                    Picker("Color", selection: $colorMode) {
+                        Text("HSV").tag(UInt32(0))
+                        Text("Palette").tag(UInt32(1))
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 140)
                 }
-                .pickerStyle(.segmented)
                 .padding(12)
                 .background(.ultraThinMaterial, in: Capsule())
-                .padding([.top, .trailing], 16)
+                .padding([.top, .horizontal], 16)
             }
         }
+    }
+}
+
+struct ZoomIndicator: View {
+    let scale: Double
+
+    private var zoomExponent: Double {
+        -log10(scale)
+    }
+
+    private var formattedZoom: String {
+        if zoomExponent < 1 {
+            return String(format: "%.1fx", 1.0 / scale)
+        } else {
+            return String(format: "10^%.1f", zoomExponent)
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 12, weight: .medium))
+            Text(formattedZoom)
+                .font(.system(size: 13, weight: .medium, design: .monospaced))
+        }
+        .foregroundColor(.primary.opacity(0.8))
+    }
+}
+
+struct ModeIndicator: View {
+    let mode: RenderingMode
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(mode == .perturbation ? Color.green : Color.blue)
+                .frame(width: 8, height: 8)
+            Text(mode == .perturbation ? "Perturb" : "Standard")
+                .font(.system(size: 12, weight: .medium))
+        }
+        .foregroundColor(.primary.opacity(0.8))
     }
 }
 
