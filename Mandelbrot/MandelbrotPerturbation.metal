@@ -32,6 +32,9 @@ struct PerturbationParams {
     uint skipIterations;      // Number of iterations to skip via series approximation
 };
 
+// Glitch detection threshold: |δ|² > ε·|z_ref|² indicates numerical instability
+constant float kGlitchThreshold = 1e-6f;
+
 // Complex multiplication: (a + bi) * (c + di) = (ac - bd) + (ad + bc)i
 inline float2 complex_mul(float2 a, float2 b) {
     return float2(a.x * b.x - a.y * b.y,
@@ -286,6 +289,206 @@ kernel void mandelbrotPerturbationWithSeriesKernel(
         half u = clamp(normIter, half(0.0), half(0.9999));
         half v = half(0.5);
         color = paletteTex.sample(paletteSampler, float2(u, v));
+        color.a = half(1.0);
+    }
+
+    output.write(color, gid);
+}
+
+// Kernel with glitch detection that writes glitch info to a buffer.
+// Glitch condition: |δ|² > ε·|z_ref|² indicates numerical instability.
+// Output buffer stores iteration where glitch was detected (0 if no glitch).
+kernel void mandelbrotPerturbationWithGlitchDetectionKernel(
+    texture2d<half, access::write> output [[texture(0)]],
+    texture2d<half> paletteTex [[texture(1)]],
+    constant PerturbationParams &params [[buffer(0)]],
+    constant float2 *referenceOrbit [[buffer(1)]],
+    device uint *glitchBuffer [[buffer(2)]],
+    sampler paletteSampler [[sampler(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+
+    uint pixelIdx = gid.y * params.width + gid.x;
+
+    float2 coord = float2(gid) / float2(params.width, params.height);
+
+    float offset_x = (coord.x - 0.5f) * params.scaleAspectHiLo.x;
+    float offset_y = (coord.y - 0.5f) * params.scaleHiLo.x;
+
+    float delta_c_x = (params.viewCenterHiLo.x - params.referenceCenterHiLo.x)
+                    + (params.viewCenterHiLo.y - params.referenceCenterHiLo.y)
+                    + offset_x;
+    float delta_c_y = (params.viewCenterHiLo.z - params.referenceCenterHiLo.z)
+                    + (params.viewCenterHiLo.w - params.referenceCenterHiLo.w)
+                    + offset_y;
+
+    float2 delta_c = float2(delta_c_x, delta_c_y);
+    float2 delta = float2(0.0);
+
+    uint iteration = 0;
+    const uint maxIter = min(params.maxIterations, params.orbitLength);
+
+    for (uint i = 0; i < maxIter; i++) {
+        float2 z_ref = referenceOrbit[i];
+        float2 z_full = z_ref + delta;
+
+        float mag_sq = dot(z_full, z_full);
+        if (mag_sq > 65536.0f) {
+            break;
+        }
+
+        // Glitch detection: |δ|² > ε·|z_ref|²
+        float delta_mag_sq = dot(delta, delta);
+        float z_ref_mag_sq = dot(z_ref, z_ref);
+        if (delta_mag_sq > kGlitchThreshold * z_ref_mag_sq && z_ref_mag_sq > 1e-20f) {
+            glitchBuffer[pixelIdx] = i;
+            output.write(half4(1.0, 0.0, 1.0, 1.0), gid);  // Magenta = glitch
+            return;
+        }
+
+        float2 two_z_ref = 2.0f * z_ref;
+        float2 term1 = complex_mul(two_z_ref, delta);
+        float2 term2 = complex_mul(delta, delta);
+        delta = term1 + term2 + delta_c;
+
+        iteration++;
+    }
+
+    glitchBuffer[pixelIdx] = 0;
+
+    if (iteration >= maxIter) {
+        output.write(half4(0.0, 0.0, 0.0, 1.0), gid);
+        return;
+    }
+
+    float2 z_ref_final = (iteration < params.orbitLength) ? referenceOrbit[iteration] : float2(0.0);
+    float2 z_full_final = z_ref_final + delta;
+    float final_mag_sq = dot(z_full_final, z_full_final);
+
+    float iteration_f = float(iteration);
+    float log_zn = fast::log(final_mag_sq) * 0.5f;
+    float nu = fast::log(log_zn * kInvLog2Perturb) * kInvLog2Perturb;
+    iteration_f = iteration_f + 1.0f - nu;
+
+    half normIter = half(iteration_f / float(params.maxIterations));
+
+    half4 color;
+    if (params.colorMode == 0u) {
+        half hue = half(pow(float(normIter), 0.3333f));
+        half3 rgb = hsv_to_rgb_perturb(hue, half(1.0), half(1.0));
+        color = half4(rgb, 1.0);
+    } else {
+        half u_tex = clamp(normIter, half(0.0), half(0.9999));
+        color = paletteTex.sample(paletteSampler, float2(u_tex, 0.5));
+        color.a = half(1.0);
+    }
+
+    output.write(color, gid);
+}
+
+// Kernel with both series approximation and glitch detection.
+kernel void mandelbrotPerturbationWithSeriesAndGlitchKernel(
+    texture2d<half, access::write> output [[texture(0)]],
+    texture2d<half> paletteTex [[texture(1)]],
+    constant PerturbationParams &params [[buffer(0)]],
+    constant float2 *referenceOrbit [[buffer(1)]],
+    constant float2 *seriesA [[buffer(2)]],
+    constant float2 *seriesB [[buffer(3)]],
+    device uint *glitchBuffer [[buffer(4)]],
+    sampler paletteSampler [[sampler(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+
+    uint pixelIdx = gid.y * params.width + gid.x;
+
+    float2 coord = float2(gid) / float2(params.width, params.height);
+
+    float offset_x = (coord.x - 0.5f) * params.scaleAspectHiLo.x;
+    float offset_y = (coord.y - 0.5f) * params.scaleHiLo.x;
+
+    float delta_c_x = (params.viewCenterHiLo.x - params.referenceCenterHiLo.x)
+                    + (params.viewCenterHiLo.y - params.referenceCenterHiLo.y)
+                    + offset_x;
+    float delta_c_y = (params.viewCenterHiLo.z - params.referenceCenterHiLo.z)
+                    + (params.viewCenterHiLo.w - params.referenceCenterHiLo.w)
+                    + offset_y;
+
+    float2 delta_c = float2(delta_c_x, delta_c_y);
+
+    uint skipIter = min(params.skipIterations, params.orbitLength);
+    float2 delta;
+
+    if (skipIter > 0 && skipIter <= params.orbitLength) {
+        uint seriesIdx = skipIter - 1;
+        float2 A = seriesA[seriesIdx];
+        float2 B = seriesB[seriesIdx];
+        float2 dc_sq = complex_mul(delta_c, delta_c);
+        delta = complex_mul(A, delta_c) + complex_mul(B, dc_sq);
+    } else {
+        delta = float2(0.0);
+        skipIter = 0;
+    }
+
+    uint iteration = skipIter;
+    const uint maxIter = min(params.maxIterations, params.orbitLength);
+
+    for (uint i = skipIter; i < maxIter; i++) {
+        float2 z_ref = referenceOrbit[i];
+        float2 z_full = z_ref + delta;
+
+        float mag_sq = dot(z_full, z_full);
+        if (mag_sq > 65536.0f) {
+            break;
+        }
+
+        float delta_mag_sq = dot(delta, delta);
+        float z_ref_mag_sq = dot(z_ref, z_ref);
+        if (delta_mag_sq > kGlitchThreshold * z_ref_mag_sq && z_ref_mag_sq > 1e-20f) {
+            glitchBuffer[pixelIdx] = i;
+            output.write(half4(1.0, 0.0, 1.0, 1.0), gid);
+            return;
+        }
+
+        float2 two_z_ref = 2.0f * z_ref;
+        float2 term1 = complex_mul(two_z_ref, delta);
+        float2 term2 = complex_mul(delta, delta);
+        delta = term1 + term2 + delta_c;
+
+        iteration++;
+    }
+
+    glitchBuffer[pixelIdx] = 0;
+
+    if (iteration >= maxIter) {
+        output.write(half4(0.0, 0.0, 0.0, 1.0), gid);
+        return;
+    }
+
+    float2 z_ref_final = (iteration < params.orbitLength) ? referenceOrbit[iteration] : float2(0.0);
+    float2 z_full_final = z_ref_final + delta;
+    float final_mag_sq = dot(z_full_final, z_full_final);
+
+    float iteration_f = float(iteration);
+    float log_zn = fast::log(final_mag_sq) * 0.5f;
+    float nu = fast::log(log_zn * kInvLog2Perturb) * kInvLog2Perturb;
+    iteration_f = iteration_f + 1.0f - nu;
+
+    half normIter = half(iteration_f / float(params.maxIterations));
+
+    half4 color;
+    if (params.colorMode == 0u) {
+        half hue = half(pow(float(normIter), 0.3333f));
+        half3 rgb = hsv_to_rgb_perturb(hue, half(1.0), half(1.0));
+        color = half4(rgb, 1.0);
+    } else {
+        half u_tex = clamp(normIter, half(0.0), half(0.9999));
+        color = paletteTex.sample(paletteSampler, float2(u_tex, 0.5));
         color.a = half(1.0);
     }
 

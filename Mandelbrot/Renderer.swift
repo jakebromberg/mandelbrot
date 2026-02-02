@@ -83,6 +83,8 @@ class Renderer: NSObject, MTKViewDelegate {
     var computePipelineState: MTLComputePipelineState
     var perturbationPipelineState: MTLComputePipelineState?
     var perturbationWithSeriesPipelineState: MTLComputePipelineState?
+    var perturbationWithGlitchPipelineState: MTLComputePipelineState?
+    var perturbationWithSeriesAndGlitchPipelineState: MTLComputePipelineState?
     var params: MandelbrotParams
     var outputTexture: MTLTexture?
     var paletteTexture: MTLTexture?
@@ -100,6 +102,11 @@ class Renderer: NSObject, MTKViewDelegate {
     private var seriesBBuffer: MTLBuffer?
     private var useSeriesApproximation: Bool = false
 
+    // Glitch detection support
+    private var glitchBuffer: MTLBuffer?
+    private var glitchDetector: GlitchDetector?
+    private var enableGlitchDetection: Bool = false
+
     /// Scale threshold below which perturbation mode is used.
     /// At scales smaller than this, single-precision floats lose accuracy.
     private let perturbationThreshold: Double = 1e-6
@@ -107,6 +114,10 @@ class Renderer: NSObject, MTKViewDelegate {
     /// Scale threshold below which series approximation provides significant benefit.
     /// Deep zooms benefit most from skipping iterations.
     private let seriesApproximationThreshold: Double = 1e-7
+
+    /// Scale threshold below which glitch detection is enabled.
+    /// Very deep zooms are more prone to numerical instability.
+    private let glitchDetectionThreshold: Double = 1e-8
 
     /// How much the center can drift (as fraction of scale) before recomputing reference orbit.
     private let referenceDriftThreshold: Double = 0.1
@@ -149,6 +160,27 @@ class Renderer: NSObject, MTKViewDelegate {
                 print("Warning: Could not create perturbation with series pipeline: \(error)")
             }
         }
+
+        // Create perturbation with glitch detection pipeline
+        if let perturbationGlitchFunction = library.makeFunction(name: "mandelbrotPerturbationWithGlitchDetectionKernel") {
+            do {
+                perturbationWithGlitchPipelineState = try device.makeComputePipelineState(function: perturbationGlitchFunction)
+            } catch {
+                print("Warning: Could not create perturbation with glitch pipeline: \(error)")
+            }
+        }
+
+        // Create perturbation with series and glitch detection pipeline
+        if let perturbationSeriesGlitchFunction = library.makeFunction(name: "mandelbrotPerturbationWithSeriesAndGlitchKernel") {
+            do {
+                perturbationWithSeriesAndGlitchPipelineState = try device.makeComputePipelineState(function: perturbationSeriesGlitchFunction)
+            } catch {
+                print("Warning: Could not create perturbation with series and glitch pipeline: \(error)")
+            }
+        }
+
+        // Initialize glitch detector
+        glitchDetector = GlitchDetector()
 
         // Set default parameters (adjust scale/center to view the desired portion).
         let drawableSize = mtkView.drawableSize
@@ -259,10 +291,28 @@ class Renderer: NSObject, MTKViewDelegate {
             renderingMode = .perturbation
             // Use series approximation for deeper zooms where it provides benefit
             useSeriesApproximation = scale < seriesApproximationThreshold && perturbationWithSeriesPipelineState != nil
+            // Enable glitch detection for very deep zooms
+            enableGlitchDetection = scale < glitchDetectionThreshold &&
+                                   (perturbationWithGlitchPipelineState != nil || perturbationWithSeriesAndGlitchPipelineState != nil)
             updateReferenceOrbitIfNeeded()
+            updateGlitchBufferIfNeeded()
         } else {
             renderingMode = .standard
             useSeriesApproximation = false
+            enableGlitchDetection = false
+        }
+    }
+
+    /// Creates or updates the glitch buffer based on current image size.
+    private func updateGlitchBufferIfNeeded() {
+        guard enableGlitchDetection else {
+            glitchBuffer = nil
+            return
+        }
+
+        let requiredSize = Int(params.width) * Int(params.height) * MemoryLayout<UInt32>.stride
+        if glitchBuffer == nil || glitchBuffer!.length < requiredSize {
+            glitchBuffer = device.makeBuffer(length: requiredSize, options: .storageModeShared)
         }
     }
 
@@ -427,16 +477,41 @@ class Renderer: NSObject, MTKViewDelegate {
                                   orbitBuffer: MTLBuffer,
                                   orbit: ReferenceOrbit,
                                   outputTexture: MTLTexture) {
-        // Determine if we should use series approximation
+        // Determine feature flags
         let canUseSeries = useSeriesApproximation &&
                           perturbationWithSeriesPipelineState != nil &&
                           seriesABuffer != nil &&
                           seriesBBuffer != nil &&
                           orbit.skipIterations > 1
 
+        let canUseGlitch = enableGlitchDetection && glitchBuffer != nil
+
+        // Select the appropriate pipeline based on enabled features
         let activePipeline: MTLComputePipelineState
-        if canUseSeries, let seriesPipeline = perturbationWithSeriesPipelineState {
-            activePipeline = seriesPipeline
+        var glitchBufferIndex: Int = 2  // Default for no-series case
+
+        if canUseSeries && canUseGlitch {
+            if let seriesGlitchPipeline = perturbationWithSeriesAndGlitchPipelineState {
+                activePipeline = seriesGlitchPipeline
+                glitchBufferIndex = 4  // After seriesA (2), seriesB (3)
+            } else if let seriesPipeline = perturbationWithSeriesPipelineState {
+                activePipeline = seriesPipeline
+            } else {
+                activePipeline = pipeline
+            }
+        } else if canUseSeries {
+            if let seriesPipeline = perturbationWithSeriesPipelineState {
+                activePipeline = seriesPipeline
+            } else {
+                activePipeline = pipeline
+            }
+        } else if canUseGlitch {
+            if let glitchPipeline = perturbationWithGlitchPipelineState {
+                activePipeline = glitchPipeline
+                glitchBufferIndex = 2
+            } else {
+                activePipeline = pipeline
+            }
         } else {
             activePipeline = pipeline
         }
@@ -470,6 +545,12 @@ class Renderer: NSObject, MTKViewDelegate {
         if canUseSeries {
             encoder.setBuffer(seriesABuffer, offset: 0, index: 2)
             encoder.setBuffer(seriesBBuffer, offset: 0, index: 3)
+        }
+
+        // Set glitch buffer if using glitch detection
+        if canUseGlitch && (activePipeline === perturbationWithGlitchPipelineState ||
+                           activePipeline === perturbationWithSeriesAndGlitchPipelineState) {
+            encoder.setBuffer(glitchBuffer, offset: 0, index: glitchBufferIndex)
         }
 
         if let sampler = paletteSampler {
