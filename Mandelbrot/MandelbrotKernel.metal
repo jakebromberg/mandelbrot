@@ -7,11 +7,11 @@ struct MandelbrotParams {
     uint width;          // The width of the output image (in pixels).
     uint height;         // The height of the output image (in pixels).
     uint maxIterations;  // Maximum iterations for the escape time algorithm.
+    uint colorMode;      // 0 = HSV, 1 = Palette
+    uint options;        // bit 0: enable periodicity check
 };
 
 // Converts HSV values (each in the range [0, 1]) to an RGB color.
-#include <metal_stdlib>
-using namespace metal;
 
 half3 hsv_to_rgb(half h, half s, half v)
 {
@@ -46,11 +46,13 @@ half3 hsv_to_rgb(half h, half s, half v)
     return rgb + half3(m, m, m);
 }
 
-inline float inv_log2() { return 1.442695f; } // 1 / log(2)
+constant float kInvLog2 = 1.442695f; // 1 / log(2)
 
 kernel void mandelbrotKernel(
     texture2d<half, access::write> output [[texture(0)]],
+    texture2d<half> paletteTex [[texture(1)]],
     constant MandelbrotParams &params [[buffer(0)]],
+    sampler paletteSampler [[sampler(0)]],
     uint2 gid [[thread_position_in_grid]]
 )
 {
@@ -90,21 +92,39 @@ kernel void mandelbrotKernel(
     float x_2 = 0.0;
     float y_2 = 0.0;
     uint iteration = 0;
-    const uint scaledMaxIterations = params.maxIterations;
+    const uint maxIterations = params.maxIterations;
+    const bool enablePeriodicity = (params.options & 0x1u) != 0u;
+    // For a cheap periodicity detection, compare to a saved z every N iterations.
+    const uint periodicityInterval = 32u;
+    const float periodicityEpsilon = 1e-12f;
+    float x_prev = 0.0f;
+    float y_prev = 0.0f;
     
     
     // Escape time algorithm.
-    while ((x_2 + y_2 <= 4.0) && (iteration < scaledMaxIterations)) {
+    while ((x_2 + y_2 <= 4.0) && (iteration < maxIterations)) {
         float xtemp = x_2 - y_2 + x0;
         y = 2.0 * x * y + y0;
         x = xtemp;
         x_2 = x*x;
         y_2 = y*y;
         iteration++;
+
+        if (enablePeriodicity && (iteration % periodicityInterval == 0u)) {
+            float dx = fabs(x - x_prev);
+            float dy = fabs(y - y_prev);
+            if (dx + dy < periodicityEpsilon) {
+                // Consider the point interior (likely periodic orbit)
+                iteration = maxIterations;
+                break;
+            }
+            x_prev = x;
+            y_prev = y;
+        }
     }
     
     // If the point is in the Mandelbrot set, color it black.
-    if (iteration == scaledMaxIterations) {
+    if (iteration == maxIterations) {
         output.write(half4(0.0, 0.0, 0.0, 1.0), gid);
         return;
     }
@@ -112,21 +132,30 @@ kernel void mandelbrotKernel(
     // Smooth the iteration count for better coloring.
     float iteration_f = float(iteration);
     float log_zn = fast::log(x_2 + y_2) * 0.5f;
-    float nu     = fast::log(log_zn * inv_log2()) * inv_log2();
+    float nu     = fast::log(log_zn * kInvLog2) * kInvLog2;
 
     iteration_f = iteration_f + 1.0 - nu;
     
-    // Normalize the iteration count and use it as the hue.
-    // (You can adjust the multiplier on iteration_f to change the color cycle.)
-    half normIter = half(iteration_f / float(scaledMaxIterations));
-    half hue = half(pow(float(normIter), 0.3333f));
-    half saturation = 1.0;
-    half value = 1.0;
-    
-    // Convert the HSV color to RGB.
-    half3 rgb = hsv_to_rgb(hue, saturation, value);
-    half4 color = half4(rgb, 1.0);
-    
+    // Normalize the iteration count for color mapping.
+    half normIter = half(iteration_f / float(maxIterations));
+
+    half4 color;
+    if (params.colorMode == 0u) {
+        // HSV mode
+        half hue = half(pow(float(normIter), 0.3333f));
+        half saturation = 1.0;
+        half value = 1.0;
+        half3 rgb = hsv_to_rgb(hue, saturation, value);
+        color = half4(rgb, 1.0);
+    } else {
+        // Palette LUT mode: sample a 1D palette implemented as a 2D texture with height=1.
+        // Avoid exact 0/1 to stay inside texture coordinates.
+        half u = clamp(normIter, half(0.0), half(0.9999));
+        half v = half(0.5);
+        color = paletteTex.sample(paletteSampler, float2(u, v));
+        color.a = half(1.0);
+    }
+
     // Write the color to the output texture.
     output.write(color, gid);
 }
