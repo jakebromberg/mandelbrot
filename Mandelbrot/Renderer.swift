@@ -107,6 +107,11 @@ class Renderer: NSObject, MTKViewDelegate {
     private var glitchDetector: GlitchDetector?
     private var enableGlitchDetection: Bool = false
 
+    // Multi-reference support
+    var multiReferencePipelineState: MTLComputePipelineState?
+    private var multiReferenceManager: MultiReferenceManager?
+    private var useMultiReference: Bool = false
+
     /// Scale threshold below which perturbation mode is used.
     /// At scales smaller than this, single-precision floats lose accuracy.
     private let perturbationThreshold: Double = 1e-6
@@ -118,6 +123,10 @@ class Renderer: NSObject, MTKViewDelegate {
     /// Scale threshold below which glitch detection is enabled.
     /// Very deep zooms are more prone to numerical instability.
     private let glitchDetectionThreshold: Double = 1e-8
+
+    /// Scale threshold below which multiple reference points are used.
+    /// Deep zooms benefit from regional references to reduce glitches.
+    private let multiReferenceThreshold: Double = 1e-7
 
     /// How much the center can drift (as fraction of scale) before recomputing reference orbit.
     private let referenceDriftThreshold: Double = 0.1
@@ -181,6 +190,18 @@ class Renderer: NSObject, MTKViewDelegate {
 
         // Initialize glitch detector
         glitchDetector = GlitchDetector()
+
+        // Create multi-reference pipeline
+        if let multiRefFunction = library.makeFunction(name: "mandelbrotMultiReferenceKernel") {
+            do {
+                multiReferencePipelineState = try device.makeComputePipelineState(function: multiRefFunction)
+            } catch {
+                print("Warning: Could not create multi-reference pipeline: \(error)")
+            }
+        }
+
+        // Initialize multi-reference manager
+        multiReferenceManager = MultiReferenceManager(gridSize: 3)
 
         // Set default parameters (adjust scale/center to view the desired portion).
         let drawableSize = mtkView.drawableSize
@@ -294,12 +315,16 @@ class Renderer: NSObject, MTKViewDelegate {
             // Enable glitch detection for very deep zooms
             enableGlitchDetection = scale < glitchDetectionThreshold &&
                                    (perturbationWithGlitchPipelineState != nil || perturbationWithSeriesAndGlitchPipelineState != nil)
+            // Use multiple reference points to reduce glitch artifacts
+            useMultiReference = scale < multiReferenceThreshold && multiReferencePipelineState != nil
             updateReferenceOrbitIfNeeded()
             updateGlitchBufferIfNeeded()
+            updateMultiReferenceIfNeeded()
         } else {
             renderingMode = .standard
             useSeriesApproximation = false
             enableGlitchDetection = false
+            useMultiReference = false
         }
     }
 
@@ -314,6 +339,20 @@ class Renderer: NSObject, MTKViewDelegate {
         if glitchBuffer == nil || glitchBuffer!.length < requiredSize {
             glitchBuffer = device.makeBuffer(length: requiredSize, options: .storageModeShared)
         }
+    }
+
+    /// Updates multi-reference manager when scale or center changes significantly.
+    private func updateMultiReferenceIfNeeded() {
+        guard useMultiReference, let manager = multiReferenceManager else {
+            return
+        }
+
+        let aspect = Double(params.width) / Double(params.height)
+        manager.partition(viewCenter: centerDouble,
+                         scale: scaleDouble,
+                         aspect: aspect,
+                         maxIterations: Int(params.maxIterations),
+                         device: device)
     }
 
     /// Checks if reference orbit needs recomputation and updates it if necessary.
@@ -415,16 +454,37 @@ class Renderer: NSObject, MTKViewDelegate {
         }
 
         // Choose rendering path based on mode
-        if renderingMode == .perturbation,
-           let perturbationPipeline = perturbationPipelineState,
-           let orbitBuffer = referenceOrbitBuffer,
-           let orbit = referenceOrbit {
-            // Perturbation rendering
-            drawPerturbation(encoder: computeEncoder,
-                           pipeline: perturbationPipeline,
-                           orbitBuffer: orbitBuffer,
-                           orbit: orbit,
-                           outputTexture: outputTexture)
+        if renderingMode == .perturbation {
+            // Check for multi-reference mode first
+            if useMultiReference,
+               let multiRefPipeline = multiReferencePipelineState,
+               let manager = multiReferenceManager,
+               let orbitBuffer = manager.combinedOrbitBuffer,
+               let boundsBuffer = manager.regionBoundsBuffer,
+               let centersBuffer = manager.regionCentersBuffer,
+               let offsetsBuffer = manager.orbitOffsetsBuffer {
+                // Multi-reference rendering
+                drawMultiReference(encoder: computeEncoder,
+                                  pipeline: multiRefPipeline,
+                                  manager: manager,
+                                  orbitBuffer: orbitBuffer,
+                                  boundsBuffer: boundsBuffer,
+                                  centersBuffer: centersBuffer,
+                                  offsetsBuffer: offsetsBuffer,
+                                  outputTexture: outputTexture)
+            } else if let perturbationPipeline = perturbationPipelineState,
+                      let orbitBuffer = referenceOrbitBuffer,
+                      let orbit = referenceOrbit {
+                // Single-reference perturbation rendering
+                drawPerturbation(encoder: computeEncoder,
+                               pipeline: perturbationPipeline,
+                               orbitBuffer: orbitBuffer,
+                               orbit: orbit,
+                               outputTexture: outputTexture)
+            } else {
+                // Fallback to standard
+                drawStandard(encoder: computeEncoder, outputTexture: outputTexture)
+            }
         } else {
             // Standard rendering
             drawStandard(encoder: computeEncoder, outputTexture: outputTexture)
@@ -552,6 +612,45 @@ class Renderer: NSObject, MTKViewDelegate {
                            activePipeline === perturbationWithSeriesAndGlitchPipelineState) {
             encoder.setBuffer(glitchBuffer, offset: 0, index: glitchBufferIndex)
         }
+
+        if let sampler = paletteSampler {
+            encoder.setSamplerState(sampler, index: 0)
+        }
+
+        dispatchThreadgroups(encoder: encoder)
+    }
+
+    private func drawMultiReference(encoder: MTLComputeCommandEncoder,
+                                    pipeline: MTLComputePipelineState,
+                                    manager: MultiReferenceManager,
+                                    orbitBuffer: MTLBuffer,
+                                    boundsBuffer: MTLBuffer,
+                                    centersBuffer: MTLBuffer,
+                                    offsetsBuffer: MTLBuffer,
+                                    outputTexture: MTLTexture) {
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(outputTexture, index: 0)
+        if let paletteTexture = paletteTexture {
+            encoder.setTexture(paletteTexture, index: 1)
+        }
+
+        let aspect = Double(params.width) / Double(params.height)
+        var multiRefParams = MultiReferenceParams(
+            viewCenter: centerDouble,
+            scale: scaleDouble,
+            scaleAspect: scaleDouble * aspect,
+            width: params.width,
+            height: params.height,
+            maxIterations: params.maxIterations,
+            regionCount: UInt32(manager.regionCount),
+            colorMode: params.colorMode
+        )
+
+        encoder.setBytes(&multiRefParams, length: MemoryLayout<MultiReferenceParams>.stride, index: 0)
+        encoder.setBuffer(orbitBuffer, offset: 0, index: 1)
+        encoder.setBuffer(boundsBuffer, offset: 0, index: 2)
+        encoder.setBuffer(centersBuffer, offset: 0, index: 3)
+        encoder.setBuffer(offsetsBuffer, offset: 0, index: 4)
 
         if let sampler = paletteSampler {
             encoder.setSamplerState(sampler, index: 0)

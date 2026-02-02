@@ -494,3 +494,129 @@ kernel void mandelbrotPerturbationWithSeriesAndGlitchKernel(
 
     output.write(color, gid);
 }
+
+// MARK: - Multi-Reference Rendering
+
+struct MultiReferenceParams {
+    float4 viewCenterHiLo;      // (hi_x, lo_x, hi_y, lo_y)
+    float2 scaleHiLo;           // (hi, lo)
+    float2 scaleAspectHiLo;     // (hi, lo)
+    uint width;
+    uint height;
+    uint maxIterations;
+    uint regionCount;
+    uint colorMode;
+    uint padding1;
+    uint padding2;
+    uint padding3;
+};
+
+// Region metadata: [offset, length, skipIterations, padding]
+struct RegionInfo {
+    uint orbitOffset;
+    uint orbitLength;
+    uint skipIterations;
+    uint padding;
+};
+
+// Kernel using multiple reference points based on screen region.
+// Each pixel selects its reference based on which region it falls into.
+kernel void mandelbrotMultiReferenceKernel(
+    texture2d<half, access::write> output [[texture(0)]],
+    texture2d<half> paletteTex [[texture(1)]],
+    constant MultiReferenceParams &params [[buffer(0)]],
+    constant float2 *allOrbits [[buffer(1)]],
+    constant float4 *regionBounds [[buffer(2)]],      // [minX, minY, maxX, maxY] per region
+    constant float4 *regionCenters [[buffer(3)]],     // [real_hi, real_lo, imag_hi, imag_lo] per region
+    constant RegionInfo *regionInfo [[buffer(4)]],
+    sampler paletteSampler [[sampler(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+
+    // Normalized pixel coordinates
+    float2 normCoord = float2(gid) / float2(params.width, params.height);
+
+    // Find which region this pixel belongs to
+    uint regionIdx = 0;
+    for (uint i = 0; i < params.regionCount; i++) {
+        float4 b = regionBounds[i];
+        if (normCoord.x >= b.x && normCoord.x < b.z &&
+            normCoord.y >= b.y && normCoord.y < b.w) {
+            regionIdx = i;
+            break;
+        }
+    }
+
+    // Get region-specific data
+    RegionInfo info = regionInfo[regionIdx];
+    float4 refCenter = regionCenters[regionIdx];
+    constant float2 *orbit = allOrbits + info.orbitOffset;
+    uint orbitLength = info.orbitLength;
+
+    // Compute pixel position in complex plane
+    float offset_x = (normCoord.x - 0.5f) * params.scaleAspectHiLo.x;
+    float offset_y = (normCoord.y - 0.5f) * params.scaleHiLo.x;
+
+    // Compute delta_c = (viewCenter + offset) - referenceCenter for this region
+    float delta_c_x = (params.viewCenterHiLo.x - refCenter.x)
+                    + (params.viewCenterHiLo.y - refCenter.y)
+                    + offset_x;
+    float delta_c_y = (params.viewCenterHiLo.z - refCenter.z)
+                    + (params.viewCenterHiLo.w - refCenter.w)
+                    + offset_y;
+
+    float2 delta_c = float2(delta_c_x, delta_c_y);
+    float2 delta = float2(0.0);
+
+    uint iteration = 0;
+    const uint maxIter = min(params.maxIterations, orbitLength);
+
+    for (uint i = 0; i < maxIter; i++) {
+        float2 z_ref = orbit[i];
+        float2 z_full = z_ref + delta;
+
+        float mag_sq = dot(z_full, z_full);
+        if (mag_sq > 65536.0f) {
+            break;
+        }
+
+        float2 two_z_ref = 2.0f * z_ref;
+        float2 term1 = complex_mul(two_z_ref, delta);
+        float2 term2 = complex_mul(delta, delta);
+        delta = term1 + term2 + delta_c;
+
+        iteration++;
+    }
+
+    if (iteration >= maxIter) {
+        output.write(half4(0.0, 0.0, 0.0, 1.0), gid);
+        return;
+    }
+
+    float2 z_ref_final = (iteration < orbitLength) ? orbit[iteration] : float2(0.0);
+    float2 z_full_final = z_ref_final + delta;
+    float final_mag_sq = dot(z_full_final, z_full_final);
+
+    float iteration_f = float(iteration);
+    float log_zn = fast::log(final_mag_sq) * 0.5f;
+    float nu = fast::log(log_zn * kInvLog2Perturb) * kInvLog2Perturb;
+    iteration_f = iteration_f + 1.0f - nu;
+
+    half normIter = half(iteration_f / float(params.maxIterations));
+
+    half4 color;
+    if (params.colorMode == 0u) {
+        half hue = half(pow(float(normIter), 0.3333f));
+        half3 rgb = hsv_to_rgb_perturb(hue, half(1.0), half(1.0));
+        color = half4(rgb, 1.0);
+    } else {
+        half u_tex = clamp(normIter, half(0.0), half(0.9999));
+        color = paletteTex.sample(paletteSampler, float2(u_tex, 0.5));
+        color.a = half(1.0);
+    }
+
+    output.write(color, gid);
+}
