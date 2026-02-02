@@ -10,6 +10,7 @@ import MetalKit
 // The Swift definition of the parameters, matching the Metal struct.
 struct MandelbrotParams {
     var scale: Float          // Region size in the complex plane.
+    var scaleAspect: Float    // Precomputed scale * aspect ratio.
     var center: SIMD2<Float>  // Center of the region.
     var width: UInt32         // Image width (in pixels).
     var height: UInt32        // Image height (in pixels).
@@ -50,8 +51,10 @@ class Renderer: NSObject, MTKViewDelegate {
         
         // Set default parameters (adjust scale/center to view the desired portion).
         let drawableSize = mtkView.drawableSize
+        let aspect = Float(drawableSize.width) / Float(drawableSize.height)
         params = MandelbrotParams(
             scale: 1,
+            scaleAspect: 1 * aspect,
             center: SIMD2<Float>(0.0, 0.0),
             width: UInt32(drawableSize.width),
             height: UInt32(drawableSize.height),
@@ -168,6 +171,7 @@ class Renderer: NSObject, MTKViewDelegate {
         }
         // Pass in the Mandelbrot parameters (index 0 for the constant buffer).
         var currentParams = params
+        currentParams.scaleAspect = params.scale * Float(params.width) / Float(params.height)
         computeEncoder.setBytes(&currentParams, length: MemoryLayout<MandelbrotParams>.stride, index: 0)
         // Sampler at index 0
         if let sampler = paletteSampler {

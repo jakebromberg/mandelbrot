@@ -3,6 +3,7 @@ using namespace metal;
 
 struct MandelbrotParams {
     float scale;         // The height (in complex plane units) of the view.
+    float scaleAspect;   // Precomputed scale * aspect ratio.
     float2 center;       // The center of the view in the complex plane.
     uint width;          // The width of the output image (in pixels).
     uint height;         // The height of the output image (in pixels).
@@ -61,12 +62,9 @@ kernel void mandelbrotKernel(
         return;
     }
     
-    // Compute aspect ratio.
-    float aspect = float(params.width) / float(params.height);
-    
     // Normalize pixel coordinate to [0, 1] and map it to the complex plane.
     float2 coord = float2(gid) / float2(params.width, params.height);
-    float x0 = (coord.x - 0.5) * params.scale * aspect + params.center.x;
+    float x0 = (coord.x - 0.5) * params.scaleAspect + params.center.x;
     float y0 = (coord.y - 0.5) * params.scale + params.center.y;
     
     // Cardioid check:
@@ -94,15 +92,14 @@ kernel void mandelbrotKernel(
     uint iteration = 0;
     const uint maxIterations = params.maxIterations;
     const bool enablePeriodicity = (params.options & 0x1u) != 0u;
-    // For a cheap periodicity detection, compare to a saved z every N iterations.
-    const uint periodicityInterval = 32u;
+    // For a cheap periodicity detection, compare to a saved z every 32 iterations.
     const float periodicityEpsilon = 1e-12f;
     float x_prev = 0.0f;
     float y_prev = 0.0f;
     
     
-    // Escape time algorithm.
-    while ((x_2 + y_2 <= 4.0) && (iteration < maxIterations)) {
+    // Escape time algorithm. Using 256^2 = 65536 as escape radius for smoother coloring.
+    while ((x_2 + y_2 <= 65536.0) && (iteration < maxIterations)) {
         float xtemp = x_2 - y_2 + x0;
         y = 2.0 * x * y + y0;
         x = xtemp;
@@ -110,7 +107,7 @@ kernel void mandelbrotKernel(
         y_2 = y*y;
         iteration++;
 
-        if (enablePeriodicity && (iteration % periodicityInterval == 0u)) {
+        if (enablePeriodicity && ((iteration & 31u) == 0u)) {
             float dx = fabs(x - x_prev);
             float dy = fabs(y - y_prev);
             if (dx + dy < periodicityEpsilon) {
