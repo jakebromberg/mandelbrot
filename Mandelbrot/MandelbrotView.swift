@@ -202,11 +202,15 @@ struct MandelbrotView: UIViewRepresentable {
     }
     
     func updateUIView(_ uiView: MTKView, context: Context) {
-        // Pass the updated scale and center to your renderer.
+        // Update colorMode and callback, but use coordinator's scale/center
+        // to avoid resetting gesture-driven changes
         if let renderer = uiView.delegate as? Renderer {
-            renderer.setCenter(center, scale: scale)
-            renderer.params.colorMode = colorMode
-            context.coordinator.colorMode = colorMode
+            // Only update center/scale if they differ from coordinator
+            // (i.e., this is an external state change, not a gesture)
+            if context.coordinator.colorMode != colorMode {
+                renderer.params.colorMode = colorMode
+                context.coordinator.colorMode = colorMode
+            }
             context.coordinator.onStateChange = onStateChange
         }
         uiView.draw()
