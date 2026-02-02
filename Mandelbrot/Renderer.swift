@@ -83,14 +83,10 @@ class Renderer: NSObject, MTKViewDelegate {
     // MARK: - Observable State (Single Source of Truth)
 
     /// Current scale in the complex plane (smaller = deeper zoom)
-    var scale: Double = 2.0 {
-        didSet { updateRenderingState() }
-    }
+    var scale: Double = 2.0
 
     /// Current center point in the complex plane
-    var center: Complex<Double> = Complex(-0.75, 0.0) {
-        didSet { updateRenderingState() }
-    }
+    var center: Complex<Double> = Complex(-0.75, 0.0)
 
     /// Color mode: 0 = HSV, 1 = Palette
     var colorMode: UInt32 = 0
@@ -333,8 +329,8 @@ class Renderer: NSObject, MTKViewDelegate {
     // MARK: - Center and Scale Management
 
     /// Updates rendering state based on current center and scale.
-    /// Called automatically via didSet when center or scale changes.
-    private func updateRenderingState() {
+    /// - Parameter skipExpensiveUpdates: If true, skips reference orbit recomputation (for gesture performance)
+    private func updateRenderingState(skipExpensiveUpdates: Bool = false) {
         // Update single-precision params for standard rendering
         params.center = SIMD2<Float>(Float(center.real), Float(center.imaginary))
         params.scale = Float(scale)
@@ -354,9 +350,13 @@ class Renderer: NSObject, MTKViewDelegate {
                                    (perturbationWithGlitchPipelineState != nil || perturbationWithSeriesAndGlitchPipelineState != nil)
             // Use multiple reference points to reduce glitch artifacts
             useMultiReference = scale < multiReferenceThreshold && multiReferencePipelineState != nil
-            updateReferenceOrbitIfNeeded()
-            updateGlitchBufferIfNeeded()
-            updateMultiReferenceIfNeeded()
+
+            // Skip expensive updates during gestures for better responsiveness
+            if !skipExpensiveUpdates {
+                updateReferenceOrbitIfNeeded()
+                updateGlitchBufferIfNeeded()
+                updateMultiReferenceIfNeeded()
+            }
         } else {
             renderingMode = .standard
             useSeriesApproximation = false
@@ -365,11 +365,12 @@ class Renderer: NSObject, MTKViewDelegate {
         }
     }
 
-    /// Legacy method for compatibility - sets center and scale together.
-    func setCenter(_ newCenter: Complex<Double>, scale newScale: Double) {
-        // Avoid triggering didSet twice by setting both before the update
+    /// Sets center and scale together, updating rendering state once.
+    /// - Parameter lowQuality: If true, skips expensive reference orbit updates (use during gestures)
+    func setView(center newCenter: Complex<Double>, scale newScale: Double, lowQuality: Bool = false) {
         center = newCenter
         scale = newScale
+        updateRenderingState(skipExpensiveUpdates: lowQuality)
     }
 
     /// Creates or updates the glitch buffer based on current image size.

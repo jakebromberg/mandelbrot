@@ -74,8 +74,7 @@ struct MandelbrotView: UIViewRepresentable {
                 let newCenterX = fractalX - (pNormX - 0.5) * newScale * aspect
                 let newCenterY = fractalY - (pNormY - 0.5) * newScale
 
-                renderer.scale = newScale
-                renderer.center = Complex(newCenterX, newCenterY)
+                renderer.setView(center: Complex(newCenterX, newCenterY), scale: newScale, lowQuality: true)
                 renderer.params.maxIterations = recommendedMaxIterations(scale: newScale, lowQuality: true)
                 mtkView?.draw()
 
@@ -85,6 +84,8 @@ struct MandelbrotView: UIViewRepresentable {
                 if let mtkView = mtkView, fullDrawableSize != .zero {
                     mtkView.drawableSize = fullDrawableSize
                 }
+                // Trigger full quality update now that gesture is complete
+                renderer.setView(center: renderer.center, scale: renderer.scale, lowQuality: false)
                 renderer.params.maxIterations = recommendedMaxIterations(scale: renderer.scale, lowQuality: false)
                 mtkView?.draw()
 
@@ -113,7 +114,8 @@ struct MandelbrotView: UIViewRepresentable {
             case .changed:
                 let dx = Double(translation.x) / Double(viewSize.width) * (renderer.scale * aspect)
                 let dy = Double(translation.y) / Double(viewSize.height) * renderer.scale
-                renderer.center = Complex(initialCenter.real - dx, initialCenter.imaginary - dy)
+                let newCenter = Complex(initialCenter.real - dx, initialCenter.imaginary - dy)
+                renderer.setView(center: newCenter, scale: renderer.scale, lowQuality: true)
                 renderer.params.maxIterations = recommendedMaxIterations(scale: renderer.scale, lowQuality: true)
                 mtkView?.draw()
 
@@ -122,6 +124,8 @@ struct MandelbrotView: UIViewRepresentable {
                 if let mtkView = mtkView, fullDrawableSize != .zero {
                     mtkView.drawableSize = fullDrawableSize
                 }
+                // Trigger full quality update now that gesture is complete
+                renderer.setView(center: renderer.center, scale: renderer.scale, lowQuality: false)
                 renderer.params.maxIterations = recommendedMaxIterations(scale: renderer.scale, lowQuality: false)
                 mtkView?.draw()
 
