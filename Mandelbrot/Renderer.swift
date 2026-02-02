@@ -32,7 +32,7 @@ struct PerturbationParams {
     var maxIterations: UInt32
     var orbitLength: UInt32
     var colorMode: UInt32
-    var padding: UInt32 = 0
+    var skipIterations: UInt32             // Number of iterations to skip via series approximation
 
     /// Splits a Double into high and low Float components.
     /// hi contains the value rounded to float precision.
@@ -51,7 +51,8 @@ struct PerturbationParams {
          height: UInt32,
          maxIterations: UInt32,
          orbitLength: UInt32,
-         colorMode: UInt32) {
+         colorMode: UInt32,
+         skipIterations: UInt32 = 0) {
 
         let refX = Self.splitDouble(referenceCenter.real)
         let refY = Self.splitDouble(referenceCenter.imaginary)
@@ -72,7 +73,7 @@ struct PerturbationParams {
         self.maxIterations = maxIterations
         self.orbitLength = orbitLength
         self.colorMode = colorMode
-        self.padding = 0
+        self.skipIterations = skipIterations
     }
 }
 
@@ -81,6 +82,7 @@ class Renderer: NSObject, MTKViewDelegate {
     let commandQueue: MTLCommandQueue
     var computePipelineState: MTLComputePipelineState
     var perturbationPipelineState: MTLComputePipelineState?
+    var perturbationWithSeriesPipelineState: MTLComputePipelineState?
     var params: MandelbrotParams
     var outputTexture: MTLTexture?
     var paletteTexture: MTLTexture?
@@ -93,9 +95,18 @@ class Renderer: NSObject, MTKViewDelegate {
     private var centerDouble: Complex<Double> = Complex(0.0, 0.0)
     private var scaleDouble: Double = 1.0
 
+    // Series approximation buffers
+    private var seriesABuffer: MTLBuffer?
+    private var seriesBBuffer: MTLBuffer?
+    private var useSeriesApproximation: Bool = false
+
     /// Scale threshold below which perturbation mode is used.
     /// At scales smaller than this, single-precision floats lose accuracy.
     private let perturbationThreshold: Double = 1e-6
+
+    /// Scale threshold below which series approximation provides significant benefit.
+    /// Deep zooms benefit most from skipping iterations.
+    private let seriesApproximationThreshold: Double = 1e-7
 
     /// How much the center can drift (as fraction of scale) before recomputing reference orbit.
     private let referenceDriftThreshold: Double = 0.1
@@ -127,6 +138,15 @@ class Renderer: NSObject, MTKViewDelegate {
                 perturbationPipelineState = try device.makeComputePipelineState(function: perturbationFunction)
             } catch {
                 print("Warning: Could not create perturbation pipeline: \(error)")
+            }
+        }
+
+        // Create perturbation with series approximation pipeline
+        if let perturbationSeriesFunction = library.makeFunction(name: "mandelbrotPerturbationWithSeriesKernel") {
+            do {
+                perturbationWithSeriesPipelineState = try device.makeComputePipelineState(function: perturbationSeriesFunction)
+            } catch {
+                print("Warning: Could not create perturbation with series pipeline: \(error)")
             }
         }
 
@@ -237,9 +257,12 @@ class Renderer: NSObject, MTKViewDelegate {
 
         if shouldUsePerturbation {
             renderingMode = .perturbation
+            // Use series approximation for deeper zooms where it provides benefit
+            useSeriesApproximation = scale < seriesApproximationThreshold && perturbationWithSeriesPipelineState != nil
             updateReferenceOrbitIfNeeded()
         } else {
             renderingMode = .standard
+            useSeriesApproximation = false
         }
     }
 
@@ -266,7 +289,20 @@ class Renderer: NSObject, MTKViewDelegate {
     /// Computes a new reference orbit at the current center.
     private func computeReferenceOrbit() {
         let orbit = ReferenceOrbit(center: centerDouble)
-        orbit.computeOrbit(maxIterations: Int(params.maxIterations))
+
+        // Compute screen diagonal squared for series validity
+        let aspect = Double(params.width) / Double(params.height)
+        let screenWidth = scaleDouble * aspect
+        let screenHeight = scaleDouble
+        let screenDiagonalSquared = screenWidth * screenWidth + screenHeight * screenHeight
+
+        // Compute orbit with series approximation if enabled
+        if useSeriesApproximation {
+            orbit.computeOrbitWithSeries(maxIterations: Int(params.maxIterations),
+                                         screenDiagonalSquared: screenDiagonalSquared)
+        } else {
+            orbit.computeOrbit(maxIterations: Int(params.maxIterations))
+        }
 
         // Pack orbit data for GPU
         let packedData = orbit.packForGPU()
@@ -277,6 +313,28 @@ class Renderer: NSObject, MTKViewDelegate {
             referenceOrbitBuffer = device.makeBuffer(bytes: packedData, length: bufferSize, options: .storageModeShared)
         } else {
             referenceOrbitBuffer = nil
+        }
+
+        // Create series approximation buffers if available
+        if useSeriesApproximation, let series = orbit.series {
+            let (aPacked, bPacked) = series.packForGPU()
+
+            if !aPacked.isEmpty {
+                let aBufferSize = aPacked.count * MemoryLayout<Float>.stride
+                seriesABuffer = device.makeBuffer(bytes: aPacked, length: aBufferSize, options: .storageModeShared)
+            } else {
+                seriesABuffer = nil
+            }
+
+            if !bPacked.isEmpty {
+                let bBufferSize = bPacked.count * MemoryLayout<Float>.stride
+                seriesBBuffer = device.makeBuffer(bytes: bPacked, length: bBufferSize, options: .storageModeShared)
+            } else {
+                seriesBBuffer = nil
+            }
+        } else {
+            seriesABuffer = nil
+            seriesBBuffer = nil
         }
 
         referenceOrbit = orbit
@@ -369,13 +427,29 @@ class Renderer: NSObject, MTKViewDelegate {
                                   orbitBuffer: MTLBuffer,
                                   orbit: ReferenceOrbit,
                                   outputTexture: MTLTexture) {
-        encoder.setComputePipelineState(pipeline)
+        // Determine if we should use series approximation
+        let canUseSeries = useSeriesApproximation &&
+                          perturbationWithSeriesPipelineState != nil &&
+                          seriesABuffer != nil &&
+                          seriesBBuffer != nil &&
+                          orbit.skipIterations > 1
+
+        let activePipeline: MTLComputePipelineState
+        if canUseSeries, let seriesPipeline = perturbationWithSeriesPipelineState {
+            activePipeline = seriesPipeline
+        } else {
+            activePipeline = pipeline
+        }
+
+        encoder.setComputePipelineState(activePipeline)
         encoder.setTexture(outputTexture, index: 0)
         if let paletteTexture = paletteTexture {
             encoder.setTexture(paletteTexture, index: 1)
         }
 
         let aspect = Double(params.width) / Double(params.height)
+        let skipIter = canUseSeries ? UInt32(orbit.skipIterations) : 0
+
         var perturbParams = PerturbationParams(
             referenceCenter: orbit.center,
             viewCenter: centerDouble,
@@ -385,11 +459,18 @@ class Renderer: NSObject, MTKViewDelegate {
             height: params.height,
             maxIterations: params.maxIterations,
             orbitLength: UInt32(orbit.count),
-            colorMode: params.colorMode
+            colorMode: params.colorMode,
+            skipIterations: skipIter
         )
 
         encoder.setBytes(&perturbParams, length: MemoryLayout<PerturbationParams>.stride, index: 0)
         encoder.setBuffer(orbitBuffer, offset: 0, index: 1)
+
+        // Set series buffers if using series approximation
+        if canUseSeries {
+            encoder.setBuffer(seriesABuffer, offset: 0, index: 2)
+            encoder.setBuffer(seriesBBuffer, offset: 0, index: 3)
+        }
 
         if let sampler = paletteSampler {
             encoder.setSamplerState(sampler, index: 0)

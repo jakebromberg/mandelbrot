@@ -29,7 +29,7 @@ struct PerturbationParams {
     uint maxIterations;       // Maximum iterations
     uint orbitLength;         // Length of reference orbit
     uint colorMode;           // 0 = HSV, 1 = Palette
-    uint padding;             // Padding for alignment
+    uint skipIterations;      // Number of iterations to skip via series approximation
 };
 
 // Complex multiplication: (a + bi) * (c + di) = (ac - bd) + (ad + bc)i
@@ -142,6 +142,118 @@ kernel void mandelbrotPerturbationKernel(
     }
 
     // If the point didn't escape within the orbit length, color it black
+    if (iteration >= maxIter) {
+        output.write(half4(0.0, 0.0, 0.0, 1.0), gid);
+        return;
+    }
+
+    // Compute final |z|² for smooth coloring
+    float2 z_ref_final = (iteration < params.orbitLength) ? referenceOrbit[iteration] : float2(0.0);
+    float2 z_full_final = z_ref_final + delta;
+    float final_mag_sq = dot(z_full_final, z_full_final);
+
+    // Smooth the iteration count
+    float iteration_f = float(iteration);
+    float log_zn = fast::log(final_mag_sq) * 0.5f;
+    float nu = fast::log(log_zn * kInvLog2Perturb) * kInvLog2Perturb;
+    iteration_f = iteration_f + 1.0f - nu;
+
+    // Normalize for color mapping
+    half normIter = half(iteration_f / float(params.maxIterations));
+
+    half4 color;
+    if (params.colorMode == 0u) {
+        // HSV mode
+        half hue = half(pow(float(normIter), 0.3333f));
+        half saturation = 1.0;
+        half value = 1.0;
+        half3 rgb = hsv_to_rgb_perturb(hue, saturation, value);
+        color = half4(rgb, 1.0);
+    } else {
+        // Palette LUT mode
+        half u = clamp(normIter, half(0.0), half(0.9999));
+        half v = half(0.5);
+        color = paletteTex.sample(paletteSampler, float2(u, v));
+        color.a = half(1.0);
+    }
+
+    output.write(color, gid);
+}
+
+// Kernel with series approximation for skipping early iterations.
+// Series: δₙ ≈ Aₙ·δc + Bₙ·δc² allows starting from skipIterations instead of 0.
+kernel void mandelbrotPerturbationWithSeriesKernel(
+    texture2d<half, access::write> output [[texture(0)]],
+    texture2d<half> paletteTex [[texture(1)]],
+    constant PerturbationParams &params [[buffer(0)]],
+    constant float2 *referenceOrbit [[buffer(1)]],
+    constant float2 *seriesA [[buffer(2)]],
+    constant float2 *seriesB [[buffer(3)]],
+    sampler paletteSampler [[sampler(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    // Ensure we're within bounds.
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+
+    // Compute normalized pixel coordinates
+    float2 coord = float2(gid) / float2(params.width, params.height);
+
+    // Compute the offset from view center in the complex plane
+    float offset_x = (coord.x - 0.5f) * params.scaleAspectHiLo.x;
+    float offset_y = (coord.y - 0.5f) * params.scaleHiLo.x;
+
+    // Compute delta_c = (viewCenter + offset) - referenceCenter
+    float delta_c_x = (params.viewCenterHiLo.x - params.referenceCenterHiLo.x)
+                    + (params.viewCenterHiLo.y - params.referenceCenterHiLo.y)
+                    + offset_x;
+    float delta_c_y = (params.viewCenterHiLo.z - params.referenceCenterHiLo.z)
+                    + (params.viewCenterHiLo.w - params.referenceCenterHiLo.w)
+                    + offset_y;
+
+    float2 delta_c = float2(delta_c_x, delta_c_y);
+
+    // Use series approximation to initialize delta at skipIterations
+    // δₙ ≈ Aₙ·δc + Bₙ·δc²
+    uint skipIter = min(params.skipIterations, params.orbitLength);
+    float2 delta;
+
+    if (skipIter > 0 && skipIter <= params.orbitLength) {
+        uint seriesIdx = skipIter - 1;
+        float2 A = seriesA[seriesIdx];
+        float2 B = seriesB[seriesIdx];
+        float2 dc_sq = complex_mul(delta_c, delta_c);
+        delta = complex_mul(A, delta_c) + complex_mul(B, dc_sq);
+    } else {
+        delta = float2(0.0);
+        skipIter = 0;
+    }
+
+    uint iteration = skipIter;
+    const uint maxIter = min(params.maxIterations, params.orbitLength);
+
+    // Continue perturbation iteration from skipIter
+    for (uint i = skipIter; i < maxIter; i++) {
+        float2 z_ref = referenceOrbit[i];
+        float2 z_full = z_ref + delta;
+
+        // Check for escape
+        float mag_sq = dot(z_full, z_full);
+        if (mag_sq > 65536.0f) {
+            break;
+        }
+
+        // Perturbation formula: δₙ₊₁ = 2·zₙ·δₙ + δₙ² + δc
+        float2 two_z_ref = 2.0f * z_ref;
+        float2 term1 = complex_mul(two_z_ref, delta);
+        float2 term2 = complex_mul(delta, delta);
+        delta = term1 + term2 + delta_c;
+
+        iteration++;
+    }
+
+    // If the point didn't escape, color it black
     if (iteration >= maxIter) {
         output.write(half4(0.0, 0.0, 0.0, 1.0), gid);
         return;
