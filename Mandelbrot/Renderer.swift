@@ -83,10 +83,18 @@ class Renderer: NSObject, MTKViewDelegate {
     // MARK: - Observable State (Single Source of Truth)
 
     /// Current scale in the complex plane (smaller = deeper zoom)
+    /// Note: Use displayScale for UI to avoid triggering updates during gestures
     var scale: Double = 2.0
 
     /// Current center point in the complex plane
+    /// Note: Use displayCenter for UI to avoid triggering updates during gestures
     var center: Complex<Double> = Complex(-0.75, 0.0)
+
+    /// Scale value for UI display - only updates on gesture end
+    private(set) var displayScale: Double = 2.0
+
+    /// Center value for UI display - only updates on gesture end
+    private(set) var displayCenter: Complex<Double> = Complex(-0.75, 0.0)
 
     /// Color mode: 0 = HSV, 1 = Palette
     var colorMode: UInt32 = 0
@@ -366,11 +374,17 @@ class Renderer: NSObject, MTKViewDelegate {
     }
 
     /// Sets center and scale together, updating rendering state once.
-    /// - Parameter lowQuality: If true, skips expensive reference orbit updates (use during gestures)
+    /// - Parameter lowQuality: If true, skips expensive updates and doesn't update display properties (use during gestures)
     func setView(center newCenter: Complex<Double>, scale newScale: Double, lowQuality: Bool = false) {
         center = newCenter
         scale = newScale
         updateRenderingState(skipExpensiveUpdates: lowQuality)
+
+        // Only update display properties on gesture end to avoid SwiftUI churn
+        if !lowQuality {
+            displayScale = newScale
+            displayCenter = newCenter
+        }
     }
 
     /// Creates or updates the glitch buffer based on current image size.

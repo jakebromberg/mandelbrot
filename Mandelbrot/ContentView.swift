@@ -19,7 +19,8 @@ struct ContentView: View {
                         .edgesIgnoringSafeArea(.all)
 
                     HStack(spacing: 12) {
-                        ZoomIndicator(scale: renderer.scale)
+                        // Use displayScale to avoid SwiftUI updates during gestures
+                        ZoomIndicator(scale: renderer.displayScale)
                         ModeIndicator(mode: renderer.renderingMode)
 
                         if renderer.precisionLevel == .doubleDouble {
