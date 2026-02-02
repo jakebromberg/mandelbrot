@@ -16,6 +16,7 @@ struct MandelbrotView: UIViewRepresentable {
     }
     var scale: Float
     var center: SIMD2<Float>
+    var colorMode: UInt32 = 0
     
     class Coordinator: NSObject {
         // These values hold the initial parameters when a gesture begins.
@@ -24,6 +25,7 @@ struct MandelbrotView: UIViewRepresentable {
         // Will be updated as gestures change.
         var scale: Float = 2.0
         var center: SIMD2<Float> = SIMD2<Float>(-0.75, 0.0)
+        var colorMode: UInt32 = 0
         
         // Stores the pinch’s center in view coordinates at the beginning of the gesture.
         var pinchCenter: CGPoint = .zero
@@ -31,6 +33,18 @@ struct MandelbrotView: UIViewRepresentable {
         // A weak reference to the MTKView (if needed).
         weak var mtkView: MTKView?
         var renderer: Renderer?
+        var fullDrawableSize: CGSize = .zero
+        let lowResFactor: CGFloat = 0.5
+
+        private func recommendedMaxIterations(scale: Float, lowQuality: Bool) -> UInt32 {
+            // Empirical mapping: grows with zoom depth; cap to reasonable bounds
+            let depth = max(1.0, log2f(1.0 / max(1e-6, scale)) + 1.0)
+            let base: Float = 256.0
+            var iters = base * depth * 2.0
+            if lowQuality { iters *= 0.33 }
+            let clamped = max(64.0, min(8192.0, iters))
+            return UInt32(clamped)
+        }
 
         // Callbacks from gesture recognizers will update our scale and center.
         @objc func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
@@ -46,6 +60,12 @@ struct MandelbrotView: UIViewRepresentable {
                 initialScale = scale
                 initialCenter = center
                 pinchCenter = location
+                // Lower resolution for interactive responsiveness
+                if let mtkView = mtkView {
+                    fullDrawableSize = mtkView.drawableSize
+                    let low = CGSize(width: fullDrawableSize.width * lowResFactor, height: fullDrawableSize.height * lowResFactor)
+                    mtkView.drawableSize = low
+                }
             case .changed:
                 // Compute the new scale. (A pinch-out, where recognizer.scale > 1, should zoom in, so new scale becomes smaller.)
                 let newScale = initialScale / Float(recognizer.scale)
@@ -67,12 +87,23 @@ struct MandelbrotView: UIViewRepresentable {
                 center = SIMD2<Float>(newCenterX, newCenterY)
                 renderer?.params.center = center
                 renderer?.params.scale = scale
-                renderer?.params.maxIterations = UInt32(1000 / scale)
-                mtkView?.setNeedsDisplay()
+                if let renderer = renderer {
+                    renderer.params.maxIterations = recommendedMaxIterations(scale: scale, lowQuality: true)
+                    renderer.params.colorMode = colorMode
+                }
+                mtkView?.draw()
             case .ended, .cancelled:
                 // Gesture finished—update the initial values.
                 initialScale = scale
                 initialCenter = center
+                // Restore full resolution and higher iterations, then draw
+                if let mtkView = mtkView, fullDrawableSize != .zero {
+                    mtkView.drawableSize = fullDrawableSize
+                }
+                if let renderer = renderer {
+                    renderer.params.maxIterations = recommendedMaxIterations(scale: scale, lowQuality: false)
+                }
+                mtkView?.draw()
             default:
                 break
             }
@@ -87,6 +118,12 @@ struct MandelbrotView: UIViewRepresentable {
             switch recognizer.state {
             case .began:
                 initialCenter = center
+                // Lower resolution at pan start
+                if let mtkView = mtkView {
+                    fullDrawableSize = mtkView.drawableSize
+                    let low = CGSize(width: fullDrawableSize.width * lowResFactor, height: fullDrawableSize.height * lowResFactor)
+                    mtkView.drawableSize = low
+                }
             case .changed:
                 // Map the translation (in pixels) to fractal-space translation.
                 let dx = Float(translation.x) / Float(viewSize.width) * (scale * aspect)
@@ -94,10 +131,21 @@ struct MandelbrotView: UIViewRepresentable {
                 // Update the center (dragging right moves the fractal left, so subtract dx).
                 center = initialCenter - SIMD2<Float>(dx, dy)
                 renderer?.params.center = center
-                mtkView?.setNeedsDisplay()
+                if let renderer = renderer {
+                    renderer.params.maxIterations = recommendedMaxIterations(scale: scale, lowQuality: true)
+                    renderer.params.colorMode = colorMode
+                }
+                mtkView?.draw()
             case .ended, .cancelled:
                 initialCenter = center
-                mtkView?.setNeedsDisplay()
+                // Restore resolution and draw high quality
+                if let mtkView = mtkView, fullDrawableSize != .zero {
+                    mtkView.drawableSize = fullDrawableSize
+                }
+                if let renderer = renderer {
+                    renderer.params.maxIterations = recommendedMaxIterations(scale: scale, lowQuality: false)
+                }
+                mtkView?.draw()
             default:
                 break
             }
@@ -118,6 +166,7 @@ struct MandelbrotView: UIViewRepresentable {
         mtkView.framebufferOnly = false  // So we can use the drawable as a blit target.
         mtkView.isPaused = true
         mtkView.enableSetNeedsDisplay = true
+        mtkView.colorPixelFormat = .bgra8Unorm
         mtkView.drawableSize = drawableSize
         
         // Create your Metal renderer (assumed implemented elsewhere).
@@ -129,6 +178,10 @@ struct MandelbrotView: UIViewRepresentable {
         
         // Save the view reference in the coordinator.
         context.coordinator.mtkView = mtkView
+        context.coordinator.fullDrawableSize = drawableSize
+        context.coordinator.scale = scale
+        context.coordinator.center = center
+        context.coordinator.colorMode = colorMode
         
         // Add the UIPinchGestureRecognizer.
         let pinchRecognizer = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePinch(_:)))
@@ -144,10 +197,11 @@ struct MandelbrotView: UIViewRepresentable {
     func updateUIView(_ uiView: MTKView, context: Context) {
         // Pass the updated scale and center to your renderer.
         if let renderer = uiView.delegate as? Renderer {
-            print("scale \(scale)")
             renderer.params.scale = scale
             renderer.params.center = center
+            renderer.params.colorMode = colorMode
+            context.coordinator.colorMode = colorMode
         }
-        uiView.setNeedsDisplay()
+        uiView.draw()
     }
 }
