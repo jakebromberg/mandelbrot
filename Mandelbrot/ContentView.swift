@@ -9,59 +9,43 @@ import SwiftUI
 import Numerics
 
 struct ContentView: View {
-    @State private var colorMode: UInt32 = 0 // 0=HSV, 1=Palette
-    @State private var currentScale: Double = 2.0
-    @State private var currentCenter: Complex<Double> = Complex(-0.75, 0.0)
-    @State private var renderingMode: RenderingMode = .standard
-    @State private var precisionLevel: PrecisionLevel = .double
-    @State private var fpsTracker = FPSTracker()
+    @State private var renderer: Renderer? = Renderer()
 
     var body: some View {
         GeometryReader { geometry in
-            ZStack(alignment: .top) {
-                MandelbrotView(
-                    size: geometry.size,
-                    scale: 2.0,
-                    center: Complex(-0.75, 0.0),
-                    colorMode: colorMode,
-                    onStateChange: { scale, center, mode, precision in
-                        currentScale = scale
-                        currentCenter = center
-                        renderingMode = mode
-                        precisionLevel = precision
-                    },
-                    fpsTracker: fpsTracker
-                )
-                .edgesIgnoringSafeArea(.all)
+            if let renderer {
+                ZStack(alignment: .top) {
+                    MandelbrotView(renderer: renderer, size: geometry.size)
+                        .edgesIgnoringSafeArea(.all)
 
-                HStack(spacing: 12) {
-                    // Zoom depth indicator
-                    ZoomIndicator(scale: currentScale)
+                    HStack(spacing: 12) {
+                        ZoomIndicator(scale: renderer.scale)
+                        ModeIndicator(mode: renderer.renderingMode)
 
-                    // Mode indicator
-                    ModeIndicator(mode: renderingMode)
+                        if renderer.precisionLevel == .doubleDouble {
+                            PrecisionIndicator(precision: renderer.precisionLevel)
+                        }
 
-                    // Precision indicator (only show at deep zooms)
-                    if precisionLevel == .doubleDouble {
-                        PrecisionIndicator(precision: precisionLevel)
+                        FPSIndicator(appFPS: renderer.appFPS, gpuFPS: renderer.gpuFPS)
+
+                        Spacer()
+
+                        Picker("Color", selection: Binding(
+                            get: { renderer.colorMode },
+                            set: { renderer.colorMode = $0 }
+                        )) {
+                            Text("HSV").tag(UInt32(0))
+                            Text("Palette").tag(UInt32(1))
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 140)
                     }
-
-                    // FPS indicator
-                    FPSIndicator(tracker: fpsTracker)
-
-                    Spacer()
-
-                    // Color mode picker
-                    Picker("Color", selection: $colorMode) {
-                        Text("HSV").tag(UInt32(0))
-                        Text("Palette").tag(UInt32(1))
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 140)
+                    .padding(12)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .padding([.top, .horizontal], 16)
                 }
-                .padding(12)
-                .background(.ultraThinMaterial, in: Capsule())
-                .padding([.top, .horizontal], 16)
+            } else {
+                Text("Metal is not supported on this device")
             }
         }
     }
@@ -123,24 +107,23 @@ struct PrecisionIndicator: View {
 }
 
 struct FPSIndicator: View {
-    let tracker: FPSTracker
+    let appFPS: Double
+    let gpuFPS: Double
 
     var body: some View {
         HStack(spacing: 8) {
-            // App FPS
             HStack(spacing: 2) {
                 Text("App:")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(.primary.opacity(0.6))
-                Text(String(format: "%.0f", tracker.appFPS))
+                Text(String(format: "%.0f", appFPS))
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
             }
-            // GPU FPS
             HStack(spacing: 2) {
                 Text("GPU:")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(.primary.opacity(0.6))
-                Text(String(format: "%.0f", tracker.gpuFPS))
+                Text(String(format: "%.0f", gpuFPS))
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
             }
         }
@@ -151,4 +134,3 @@ struct FPSIndicator: View {
 #Preview {
     ContentView()
 }
-

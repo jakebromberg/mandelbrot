@@ -7,6 +7,7 @@
 
 import MetalKit
 import Numerics
+import Observation
 
 // The Swift definition of the parameters, matching the Metal struct.
 struct MandelbrotParams {
@@ -77,7 +78,37 @@ struct PerturbationParams {
     }
 }
 
+@Observable
 class Renderer: NSObject, MTKViewDelegate {
+    // MARK: - Observable State (Single Source of Truth)
+
+    /// Current scale in the complex plane (smaller = deeper zoom)
+    var scale: Double = 2.0 {
+        didSet { updateRenderingState() }
+    }
+
+    /// Current center point in the complex plane
+    var center: Complex<Double> = Complex(-0.75, 0.0) {
+        didSet { updateRenderingState() }
+    }
+
+    /// Color mode: 0 = HSV, 1 = Palette
+    var colorMode: UInt32 = 0
+
+    /// Current rendering mode (read-only for UI)
+    private(set) var renderingMode: RenderingMode = .standard
+
+    /// Current precision level (read-only for UI)
+    private(set) var precisionLevel: PrecisionLevel = .double
+
+    /// App frames per second (time between draw calls)
+    private(set) var appFPS: Double = 0
+
+    /// GPU frames per second (shader execution time)
+    private(set) var gpuFPS: Double = 0
+
+    // MARK: - Metal Resources
+
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     var computePipelineState: MTLComputePipelineState
@@ -90,12 +121,10 @@ class Renderer: NSObject, MTKViewDelegate {
     var paletteTexture: MTLTexture?
     var paletteSampler: MTLSamplerState?
 
-    // Perturbation theory support
-    private(set) var renderingMode: RenderingMode = .standard
+    // MARK: - Perturbation Theory Support
+
     private var referenceOrbit: ReferenceOrbit?
     private var referenceOrbitBuffer: MTLBuffer?
-    private var centerDouble: Complex<Double> = Complex(0.0, 0.0)
-    private var scaleDouble: Double = 1.0
 
     // Series approximation buffers
     private var seriesABuffer: MTLBuffer?
@@ -113,11 +142,14 @@ class Renderer: NSObject, MTKViewDelegate {
     private var useMultiReference: Bool = false
 
     // Precision level support
-    private(set) var precisionLevel: PrecisionLevel = .double
     private var referenceOrbitDD: ReferenceOrbitDD?
 
-    // FPS tracking
-    var fpsTracker: FPSTracker?
+    // MARK: - FPS Tracking (Internal)
+
+    private var lastDrawTime: CFAbsoluteTime = 0
+    private var appFPSAccumulator: Double = 0
+    private var gpuFPSAccumulator: Double = 0
+    private var fpsFrameCount: Int = 0
 
     /// Scale threshold below which perturbation mode is used.
     /// At scales smaller than this, single-precision floats lose accuracy.
@@ -138,9 +170,9 @@ class Renderer: NSObject, MTKViewDelegate {
     /// How much the center can drift (as fraction of scale) before recomputing reference orbit.
     private let referenceDriftThreshold: Double = 0.1
     
-    init?(mtkView: MTKView) {
-        // Ensure a Metal device is available.
-        guard let device = mtkView.device else { return nil }
+    init?(device: MTLDevice? = nil) {
+        // Use provided device or create system default
+        guard let device = device ?? MTLCreateSystemDefaultDevice() else { return nil }
         self.device = device
 
         guard let commandQueue = device.makeCommandQueue() else { return nil }
@@ -210,15 +242,13 @@ class Renderer: NSObject, MTKViewDelegate {
         // Initialize multi-reference manager
         multiReferenceManager = MultiReferenceManager(gridSize: 3)
 
-        // Set default parameters (adjust scale/center to view the desired portion).
-        let drawableSize = mtkView.drawableSize
-        let aspect = Float(drawableSize.width) / Float(drawableSize.height)
+        // Set default parameters (will be updated when view size is known)
         params = MandelbrotParams(
-            scale: 1,
-            scaleAspect: 1 * aspect,
-            center: SIMD2<Float>(0.0, 0.0),
-            width: UInt32(drawableSize.width),
-            height: UInt32(drawableSize.height),
+            scale: 2.0,
+            scaleAspect: 2.0,
+            center: SIMD2<Float>(-0.75, 0.0),
+            width: 1,
+            height: 1,
             maxIterations: 512,
             colorMode: 0,
             options: 1 // enable periodicity
@@ -226,8 +256,7 @@ class Renderer: NSObject, MTKViewDelegate {
 
         super.init()
 
-        // Create an output texture to hold the computed image.
-        createOutputTexture(size: drawableSize)
+        // Output texture will be created when drawable size is known (mtkView:drawableSizeWillChange)
 
         // Create a default palette and sampler.
         createPaletteTexture()
@@ -303,11 +332,9 @@ class Renderer: NSObject, MTKViewDelegate {
 
     // MARK: - Center and Scale Management
 
-    /// Sets the center and scale, automatically choosing rendering mode and updating reference orbit as needed.
-    func setCenter(_ center: Complex<Double>, scale: Double) {
-        centerDouble = center
-        scaleDouble = scale
-
+    /// Updates rendering state based on current center and scale.
+    /// Called automatically via didSet when center or scale changes.
+    private func updateRenderingState() {
         // Update single-precision params for standard rendering
         params.center = SIMD2<Float>(Float(center.real), Float(center.imaginary))
         params.scale = Float(scale)
@@ -338,6 +365,13 @@ class Renderer: NSObject, MTKViewDelegate {
         }
     }
 
+    /// Legacy method for compatibility - sets center and scale together.
+    func setCenter(_ newCenter: Complex<Double>, scale newScale: Double) {
+        // Avoid triggering didSet twice by setting both before the update
+        center = newCenter
+        scale = newScale
+    }
+
     /// Creates or updates the glitch buffer based on current image size.
     private func updateGlitchBufferIfNeeded() {
         guard enableGlitchDetection else {
@@ -358,8 +392,8 @@ class Renderer: NSObject, MTKViewDelegate {
         }
 
         let aspect = Double(params.width) / Double(params.height)
-        manager.partition(viewCenter: centerDouble,
-                         scale: scaleDouble,
+        manager.partition(viewCenter: center,
+                         scale: scale,
                          aspect: aspect,
                          maxIterations: Int(params.maxIterations),
                          device: device)
@@ -372,10 +406,10 @@ class Renderer: NSObject, MTKViewDelegate {
         let needsRecompute: Bool
         if let existing = referenceOrbit {
             // Check if center has drifted too far from reference
-            let drift = Complex(centerDouble.real - existing.center.real,
-                               centerDouble.imaginary - existing.center.imaginary)
+            let drift = Complex(center.real - existing.center.real,
+                               center.imaginary - existing.center.imaginary)
             let driftMagnitude = sqrt(drift.real * drift.real + drift.imaginary * drift.imaginary)
-            needsRecompute = driftMagnitude > scaleDouble * referenceDriftThreshold
+            needsRecompute = driftMagnitude > scale * referenceDriftThreshold
         } else {
             needsRecompute = true
         }
@@ -389,8 +423,8 @@ class Renderer: NSObject, MTKViewDelegate {
     private func computeReferenceOrbit() {
         // Compute screen diagonal squared for series validity
         let aspect = Double(params.width) / Double(params.height)
-        let screenWidth = scaleDouble * aspect
-        let screenHeight = scaleDouble
+        let screenWidth = scale * aspect
+        let screenHeight = scale
         let screenDiagonalSquared = screenWidth * screenWidth + screenHeight * screenHeight
 
         // Choose precision based on zoom depth
@@ -398,17 +432,17 @@ class Renderer: NSObject, MTKViewDelegate {
 
         if precisionLevel == .doubleDouble {
             // Use double-double precision for ultra-deep zooms
-            let orbitDD = ReferenceOrbitDD(center: centerDouble)
+            let orbitDD = ReferenceOrbitDD(center: center)
             orbitDD.computeOrbit(maxIterations: Int(params.maxIterations))
             referenceOrbitDD = orbitDD
 
             // Create a standard orbit wrapper from the DD orbit for compatibility
-            orbit = ReferenceOrbit(center: centerDouble)
+            orbit = ReferenceOrbit(center: center)
             // Copy the orbit data (converting back to simd_double2)
             orbit.orbitSimd = orbitDD.orbitAsSimd
         } else {
             // Standard double precision
-            orbit = ReferenceOrbit(center: centerDouble)
+            orbit = ReferenceOrbit(center: center)
             referenceOrbitDD = nil
 
             // Compute orbit with series approximation if enabled
@@ -481,8 +515,17 @@ class Renderer: NSObject, MTKViewDelegate {
     
     // MTKViewDelegate: Called each frame.
     func draw(in view: MTKView) {
-        // Track frame timing
-        let gpuStartTime = fpsTracker?.frameStarted() ?? 0
+        // Track app FPS (time between draw calls)
+        let currentTime = CFAbsoluteTimeGetCurrent()
+        if lastDrawTime > 0 {
+            let frameDuration = currentTime - lastDrawTime
+            if frameDuration > 0 {
+                appFPSAccumulator += 1.0 / frameDuration
+                fpsFrameCount += 1
+            }
+        }
+        lastDrawTime = currentTime
+        let gpuStartTime = currentTime
 
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let outputTexture = outputTexture,
@@ -551,10 +594,22 @@ class Renderer: NSObject, MTKViewDelegate {
         commandBuffer.present(drawable)
 
         // Track GPU FPS via completion handler
-        if let tracker = fpsTracker {
-            commandBuffer.addCompletedHandler { _ in
+        commandBuffer.addCompletedHandler { [weak self] _ in
+            guard let self = self else { return }
+            let gpuEndTime = CFAbsoluteTimeGetCurrent()
+            let gpuDuration = gpuEndTime - gpuStartTime
+            if gpuDuration > 0 {
+                self.gpuFPSAccumulator += 1.0 / gpuDuration
+            }
+
+            // Update published FPS every 10 frames for smoother readings
+            if self.fpsFrameCount >= 10 {
                 DispatchQueue.main.async {
-                    tracker.frameCompleted(startTime: gpuStartTime)
+                    self.appFPS = self.appFPSAccumulator / Double(self.fpsFrameCount)
+                    self.gpuFPS = self.gpuFPSAccumulator / Double(self.fpsFrameCount)
+                    self.appFPSAccumulator = 0
+                    self.gpuFPSAccumulator = 0
+                    self.fpsFrameCount = 0
                 }
             }
         }
@@ -635,9 +690,9 @@ class Renderer: NSObject, MTKViewDelegate {
 
         var perturbParams = PerturbationParams(
             referenceCenter: orbit.center,
-            viewCenter: centerDouble,
-            scale: scaleDouble,
-            scaleAspect: scaleDouble * aspect,
+            viewCenter: center,
+            scale: scale,
+            scaleAspect: scale * aspect,
             width: params.width,
             height: params.height,
             maxIterations: params.maxIterations,
@@ -684,9 +739,9 @@ class Renderer: NSObject, MTKViewDelegate {
 
         let aspect = Double(params.width) / Double(params.height)
         var multiRefParams = MultiReferenceParams(
-            viewCenter: centerDouble,
-            scale: scaleDouble,
-            scaleAspect: scaleDouble * aspect,
+            viewCenter: center,
+            scale: scale,
+            scaleAspect: scale * aspect,
             width: params.width,
             height: params.height,
             maxIterations: params.maxIterations,
