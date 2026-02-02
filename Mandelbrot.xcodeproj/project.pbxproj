@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		230F1B2E2F3136FE008EFA85 /* Numerics in Frameworks */ = {isa = PBXBuildFile; productRef = 23NUMERICSPD2D570F9800F9B18E /* Numerics */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		2386F0FA2D570F9A00F9B18E /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -52,6 +56,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				230F1B2E2F3136FE008EFA85 /* Numerics in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -70,25 +75,6 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
-
-/* Begin XCRemoteSwiftPackageReference section */
-		23NUMERICS2D570F9800F9B18E /* XCRemoteSwiftPackageReference "swift-numerics" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/apple/swift-numerics";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 1.0.0;
-			};
-		};
-/* End XCRemoteSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		23NUMERICSPD2D570F9800F9B18E /* Numerics */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 23NUMERICS2D570F9800F9B18E /* XCRemoteSwiftPackageReference "swift-numerics" */;
-			productName = Numerics;
-		};
-/* End XCSwiftPackageProductDependency section */
 
 /* Begin PBXGroup section */
 		2386F0E02D570F9800F9B18E = {
@@ -583,6 +569,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		23NUMERICS2D570F9800F9B18E /* XCRemoteSwiftPackageReference "swift-numerics" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-numerics";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		23NUMERICSPD2D570F9800F9B18E /* Numerics */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 23NUMERICS2D570F9800F9B18E /* XCRemoteSwiftPackageReference "swift-numerics" */;
+			productName = Numerics;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 2386F0E12D570F9800F9B18E /* Project object */;
 }

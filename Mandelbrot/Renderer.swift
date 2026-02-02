@@ -116,6 +116,9 @@ class Renderer: NSObject, MTKViewDelegate {
     private(set) var precisionLevel: PrecisionLevel = .double
     private var referenceOrbitDD: ReferenceOrbitDD?
 
+    // FPS tracking
+    var fpsTracker: FPSTracker?
+
     /// Scale threshold below which perturbation mode is used.
     /// At scales smaller than this, single-precision floats lose accuracy.
     private let perturbationThreshold: Double = 1e-6
@@ -478,6 +481,9 @@ class Renderer: NSObject, MTKViewDelegate {
     
     // MTKViewDelegate: Called each frame.
     func draw(in view: MTKView) {
+        // Track frame timing
+        let gpuStartTime = fpsTracker?.frameStarted() ?? 0
+
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let outputTexture = outputTexture,
               let drawable = view.currentDrawable,
@@ -543,6 +549,16 @@ class Renderer: NSObject, MTKViewDelegate {
         }
 
         commandBuffer.present(drawable)
+
+        // Track GPU FPS via completion handler
+        if let tracker = fpsTracker {
+            commandBuffer.addCompletedHandler { _ in
+                DispatchQueue.main.async {
+                    tracker.frameCompleted(startTime: gpuStartTime)
+                }
+            }
+        }
+
         commandBuffer.commit()
     }
 

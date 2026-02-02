@@ -14,6 +14,7 @@ struct ContentView: View {
     @State private var currentCenter: Complex<Double> = Complex(-0.75, 0.0)
     @State private var renderingMode: RenderingMode = .standard
     @State private var precisionLevel: PrecisionLevel = .double
+    @State private var fpsTracker = FPSTracker()
 
     var body: some View {
         GeometryReader { geometry in
@@ -28,7 +29,8 @@ struct ContentView: View {
                         currentCenter = center
                         renderingMode = mode
                         precisionLevel = precision
-                    }
+                    },
+                    fpsTracker: fpsTracker
                 )
                 .edgesIgnoringSafeArea(.all)
 
@@ -43,6 +45,9 @@ struct ContentView: View {
                     if precisionLevel == .doubleDouble {
                         PrecisionIndicator(precision: precisionLevel)
                     }
+
+                    // FPS indicator
+                    FPSIndicator(tracker: fpsTracker)
 
                     Spacer()
 
@@ -114,6 +119,32 @@ struct PrecisionIndicator: View {
                 .font(.system(size: 12, weight: .medium, design: .monospaced))
         }
         .foregroundColor(.orange.opacity(0.9))
+    }
+}
+
+struct FPSIndicator: View {
+    let tracker: FPSTracker
+
+    var body: some View {
+        HStack(spacing: 8) {
+            // App FPS
+            HStack(spacing: 2) {
+                Text("App:")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.primary.opacity(0.6))
+                Text(String(format: "%.0f", tracker.appFPS))
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+            }
+            // GPU FPS
+            HStack(spacing: 2) {
+                Text("GPU:")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.primary.opacity(0.6))
+                Text(String(format: "%.0f", tracker.gpuFPS))
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+            }
+        }
+        .foregroundColor(.primary.opacity(0.8))
     }
 }
 

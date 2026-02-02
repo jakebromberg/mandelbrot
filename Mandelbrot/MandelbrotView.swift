@@ -19,6 +19,7 @@ struct MandelbrotView: UIViewRepresentable {
     var center: Complex<Double>
     var colorMode: UInt32 = 0
     var onStateChange: ((Double, Complex<Double>, RenderingMode, PrecisionLevel) -> Void)?
+    var fpsTracker: FPSTracker?
 
     class Coordinator: NSObject {
         // These values hold the initial parameters when a gesture begins.
@@ -29,8 +30,8 @@ struct MandelbrotView: UIViewRepresentable {
         var center: Complex<Double> = Complex(-0.75, 0.0)
         var colorMode: UInt32 = 0
         var onStateChange: ((Double, Complex<Double>, RenderingMode, PrecisionLevel) -> Void)?
-        
-        // Stores the pinch’s center in view coordinates at the beginning of the gesture.
+
+        // Stores the pinch's center in view coordinates at the beginning of the gesture.
         var pinchCenter: CGPoint = .zero
         
         // A weak reference to the MTKView (if needed).
@@ -190,6 +191,9 @@ struct MandelbrotView: UIViewRepresentable {
         context.coordinator.colorMode = colorMode
         context.coordinator.onStateChange = onStateChange
 
+        // Connect FPS tracker to renderer
+        renderer.fpsTracker = fpsTracker
+
         // Add the UIPinchGestureRecognizer.
         let pinchRecognizer = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePinch(_:)))
         mtkView.addGestureRecognizer(pinchRecognizer)
@@ -212,6 +216,7 @@ struct MandelbrotView: UIViewRepresentable {
                 context.coordinator.colorMode = colorMode
             }
             context.coordinator.onStateChange = onStateChange
+            renderer.fpsTracker = fpsTracker
         }
         uiView.draw()
     }
