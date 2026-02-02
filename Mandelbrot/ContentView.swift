@@ -13,6 +13,7 @@ struct ContentView: View {
     @State private var currentScale: Double = 2.0
     @State private var currentCenter: Complex<Double> = Complex(-0.75, 0.0)
     @State private var renderingMode: RenderingMode = .standard
+    @State private var precisionLevel: PrecisionLevel = .double
 
     var body: some View {
         GeometryReader { geometry in
@@ -22,10 +23,11 @@ struct ContentView: View {
                     scale: 2.0,
                     center: Complex(-0.75, 0.0),
                     colorMode: colorMode,
-                    onStateChange: { scale, center, mode in
+                    onStateChange: { scale, center, mode, precision in
                         currentScale = scale
                         currentCenter = center
                         renderingMode = mode
+                        precisionLevel = precision
                     }
                 )
                 .edgesIgnoringSafeArea(.all)
@@ -36,6 +38,11 @@ struct ContentView: View {
 
                     // Mode indicator
                     ModeIndicator(mode: renderingMode)
+
+                    // Precision indicator (only show at deep zooms)
+                    if precisionLevel == .doubleDouble {
+                        PrecisionIndicator(precision: precisionLevel)
+                    }
 
                     Spacer()
 
@@ -93,6 +100,20 @@ struct ModeIndicator: View {
                 .font(.system(size: 12, weight: .medium))
         }
         .foregroundColor(.primary.opacity(0.8))
+    }
+}
+
+struct PrecisionIndicator: View {
+    let precision: PrecisionLevel
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "number.circle.fill")
+                .font(.system(size: 10))
+            Text(precision == .doubleDouble ? "DD" : "D")
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+        }
+        .foregroundColor(.orange.opacity(0.9))
     }
 }
 

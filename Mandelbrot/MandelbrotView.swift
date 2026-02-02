@@ -18,7 +18,7 @@ struct MandelbrotView: UIViewRepresentable {
     var scale: Double
     var center: Complex<Double>
     var colorMode: UInt32 = 0
-    var onStateChange: ((Double, Complex<Double>, RenderingMode) -> Void)?
+    var onStateChange: ((Double, Complex<Double>, RenderingMode, PrecisionLevel) -> Void)?
 
     class Coordinator: NSObject {
         // These values hold the initial parameters when a gesture begins.
@@ -28,7 +28,7 @@ struct MandelbrotView: UIViewRepresentable {
         var scale: Double = 2.0
         var center: Complex<Double> = Complex(-0.75, 0.0)
         var colorMode: UInt32 = 0
-        var onStateChange: ((Double, Complex<Double>, RenderingMode) -> Void)?
+        var onStateChange: ((Double, Complex<Double>, RenderingMode, PrecisionLevel) -> Void)?
         
         // Stores the pinch’s center in view coordinates at the beginning of the gesture.
         var pinchCenter: CGPoint = .zero
@@ -94,7 +94,7 @@ struct MandelbrotView: UIViewRepresentable {
                     renderer.params.colorMode = colorMode
                 }
                 mtkView?.draw()
-                onStateChange?(scale, center, renderer?.renderingMode ?? .standard)
+                onStateChange?(scale, center, renderer?.renderingMode ?? .standard, renderer?.precisionLevel ?? .double)
             case .ended, .cancelled:
                 // Gesture finished—update the initial values.
                 initialScale = scale
@@ -107,7 +107,7 @@ struct MandelbrotView: UIViewRepresentable {
                     renderer.params.maxIterations = recommendedMaxIterations(scale: scale, lowQuality: false)
                 }
                 mtkView?.draw()
-                onStateChange?(scale, center, renderer?.renderingMode ?? .standard)
+                onStateChange?(scale, center, renderer?.renderingMode ?? .standard, renderer?.precisionLevel ?? .double)
             default:
                 break
             }
@@ -140,7 +140,7 @@ struct MandelbrotView: UIViewRepresentable {
                     renderer.params.colorMode = colorMode
                 }
                 mtkView?.draw()
-                onStateChange?(scale, center, renderer?.renderingMode ?? .standard)
+                onStateChange?(scale, center, renderer?.renderingMode ?? .standard, renderer?.precisionLevel ?? .double)
             case .ended, .cancelled:
                 initialCenter = center
                 // Restore resolution and draw high quality
@@ -151,7 +151,7 @@ struct MandelbrotView: UIViewRepresentable {
                     renderer.params.maxIterations = recommendedMaxIterations(scale: scale, lowQuality: false)
                 }
                 mtkView?.draw()
-                onStateChange?(scale, center, renderer?.renderingMode ?? .standard)
+                onStateChange?(scale, center, renderer?.renderingMode ?? .standard, renderer?.precisionLevel ?? .double)
             default:
                 break
             }

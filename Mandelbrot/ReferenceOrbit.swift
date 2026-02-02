@@ -22,7 +22,7 @@ class ReferenceOrbit {
     let centerSimd: simd_double2
 
     /// The computed orbit points (z values at each iteration) using simd_double2.
-    private(set) var orbitSimd: [simd_double2] = []
+    var orbitSimd: [simd_double2] = []
 
     /// The number of iterations the reference point took to escape (or maxIterations if it didn't).
     private(set) var escapeIteration: Int = 0
@@ -141,6 +141,89 @@ class ReferenceOrbit {
 enum RenderingMode: String {
     case standard = "Standard"
     case perturbation = "Perturbation"
+}
+
+// MARK: - Double-Double Precision Reference Orbit
+
+/// Reference orbit using double-double precision for ultra-deep zooms (10^14 - 10^28).
+class ReferenceOrbitDD {
+    /// The center point using double-double precision.
+    let center: ComplexDD
+
+    /// The computed orbit points using double-double precision.
+    private(set) var orbit: [ComplexDD] = []
+
+    /// The number of iterations the reference point took to escape.
+    private(set) var escapeIteration: Int = 0
+
+    /// Whether the reference point escaped.
+    private(set) var didEscape: Bool = false
+
+    init(center: ComplexDD) {
+        self.center = center
+    }
+
+    /// Convenience initializer from Complex<Double>.
+    convenience init(center: Complex<Double>) {
+        self.init(center: ComplexDD(from: center))
+    }
+
+    /// Computes the reference orbit at double-double precision.
+    /// - Parameter maxIterations: Maximum number of iterations.
+    /// - Returns: The number of iterations computed.
+    @discardableResult
+    func computeOrbit(maxIterations: Int) -> Int {
+        orbit.removeAll()
+        orbit.reserveCapacity(maxIterations)
+
+        var z = ComplexDD.zero
+        let c = center
+        let escapeRadius = DoubleDouble(65536.0)
+
+        for i in 0..<maxIterations {
+            orbit.append(z)
+
+            // z = z² + c
+            z = z.squared() + c
+
+            // Check for escape
+            if z.magnitudeSquared > escapeRadius {
+                escapeIteration = i + 1
+                didEscape = true
+                return orbit.count
+            }
+        }
+
+        escapeIteration = maxIterations
+        didEscape = false
+        return orbit.count
+    }
+
+    /// Packs the orbit into GPU-friendly format (converts to float pairs).
+    /// The GPU still uses float precision for perturbation; this just computes
+    /// a more accurate reference orbit.
+    func packForGPU() -> [Float] {
+        var packed = [Float]()
+        packed.reserveCapacity(orbit.count * 2)
+
+        for z in orbit {
+            // Convert double-double to double, then to float
+            packed.append(Float(z.real.doubleValue))
+            packed.append(Float(z.imag.doubleValue))
+        }
+
+        return packed
+    }
+
+    /// Returns the orbit as simd_double2 array for compatibility with series approximation.
+    var orbitAsSimd: [simd_double2] {
+        orbit.map { simd_double2($0.real.doubleValue, $0.imag.doubleValue) }
+    }
+
+    /// Returns the number of points in the orbit.
+    var count: Int {
+        return orbit.count
+    }
 }
 
 // MARK: - Complex extension for convenience

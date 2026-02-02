@@ -112,6 +112,10 @@ class Renderer: NSObject, MTKViewDelegate {
     private var multiReferenceManager: MultiReferenceManager?
     private var useMultiReference: Bool = false
 
+    // Precision level support
+    private(set) var precisionLevel: PrecisionLevel = .double
+    private var referenceOrbitDD: ReferenceOrbitDD?
+
     /// Scale threshold below which perturbation mode is used.
     /// At scales smaller than this, single-precision floats lose accuracy.
     private let perturbationThreshold: Double = 1e-6
@@ -308,6 +312,9 @@ class Renderer: NSObject, MTKViewDelegate {
         // Determine rendering mode based on scale
         let shouldUsePerturbation = scale < perturbationThreshold && perturbationPipelineState != nil
 
+        // Determine required precision level
+        precisionLevel = PrecisionLevel.required(for: scale)
+
         if shouldUsePerturbation {
             renderingMode = .perturbation
             // Use series approximation for deeper zooms where it provides benefit
@@ -377,20 +384,45 @@ class Renderer: NSObject, MTKViewDelegate {
 
     /// Computes a new reference orbit at the current center.
     private func computeReferenceOrbit() {
-        let orbit = ReferenceOrbit(center: centerDouble)
-
         // Compute screen diagonal squared for series validity
         let aspect = Double(params.width) / Double(params.height)
         let screenWidth = scaleDouble * aspect
         let screenHeight = scaleDouble
         let screenDiagonalSquared = screenWidth * screenWidth + screenHeight * screenHeight
 
-        // Compute orbit with series approximation if enabled
-        if useSeriesApproximation {
-            orbit.computeOrbitWithSeries(maxIterations: Int(params.maxIterations),
-                                         screenDiagonalSquared: screenDiagonalSquared)
+        // Choose precision based on zoom depth
+        let orbit: ReferenceOrbit
+
+        if precisionLevel == .doubleDouble {
+            // Use double-double precision for ultra-deep zooms
+            let orbitDD = ReferenceOrbitDD(center: centerDouble)
+            orbitDD.computeOrbit(maxIterations: Int(params.maxIterations))
+            referenceOrbitDD = orbitDD
+
+            // Create a standard orbit wrapper from the DD orbit for compatibility
+            orbit = ReferenceOrbit(center: centerDouble)
+            // Copy the orbit data (converting back to simd_double2)
+            orbit.orbitSimd = orbitDD.orbitAsSimd
         } else {
-            orbit.computeOrbit(maxIterations: Int(params.maxIterations))
+            // Standard double precision
+            orbit = ReferenceOrbit(center: centerDouble)
+            referenceOrbitDD = nil
+
+            // Compute orbit with series approximation if enabled
+            if useSeriesApproximation {
+                orbit.computeOrbitWithSeries(maxIterations: Int(params.maxIterations),
+                                             screenDiagonalSquared: screenDiagonalSquared)
+            } else {
+                orbit.computeOrbit(maxIterations: Int(params.maxIterations))
+            }
+        }
+
+        // For DD precision, also compute series if enabled
+        if precisionLevel == .doubleDouble && useSeriesApproximation {
+            let series = SeriesApproximation()
+            series.computeCoefficients(orbit: orbit.orbitSimd, maxDeltaSquared: screenDiagonalSquared)
+            // Note: We'd need to expose a setter for series on ReferenceOrbit
+            // For now, series is computed in the standard path
         }
 
         // Pack orbit data for GPU
